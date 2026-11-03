@@ -3,20 +3,23 @@
 SSTable mu Format: Physical Index Positions
 ============================================
 
-The ``mu`` format is the ``mt`` format with three changes. All apply only to
-compressed SSTables:
+The ``mu`` format is the ``mt`` format with four changes. The first three
+apply only to compressed SSTables:
 
 * Each compressed chunk in ``Data.db`` stores its own length, in a header and
   in a footer.
 * The index components (``Partitions.db`` and ``Rows.db``) point to positions
   in the compressed file, not in the uncompressed data.
 * ``CompressionInfo.db`` stores only a random sample of the chunk offsets.
+* ``Scylla.db`` always contains the ``incompatible_features`` subcomponent.
 
-With these changes, a reader can find any row without the chunk offsets from
-``CompressionInfo.db``. Thus, it does not need to keep those offsets in memory.
+With the first three changes, a reader can find any row without the chunk
+offsets from ``CompressionInfo.db``. Thus, it does not need to keep those
+offsets in memory.
 
-An uncompressed ``mu`` SSTable is identical to an uncompressed ``mt`` SSTable.
-All components not described on this page are identical to ``mt``.
+An uncompressed ``mu`` SSTable differs from an uncompressed ``mt`` SSTable only
+in ``Scylla.db``. All components not described on this page are identical to
+``mt``.
 
 Notation and parameters
 -----------------------
@@ -296,3 +299,21 @@ The top bit of ``V`` selects the target:
 
   To decode ``C``, clear the top bit of ``V`` and shift the result right by
   ``W_N + W_O`` bits.
+
+Scylla.db: incompatible features
+--------------------------------
+
+``Scylla.db`` of a ``mu`` SSTable always contains the ``incompatible_features``
+subcomponent (tag 15). It is a set of feature bits. A set bit means that the
+SSTable uses a feature that changes how it must be read. A reader must refuse
+to open an SSTable with a set bit that it doesn't know. Thus, later Scylla
+versions can add such features without a new format version. No such features
+are defined yet, so the writer writes no set bits. See
+`the Scylla.db format <https://github.com/scylladb/scylladb/blob/master/docs/dev/sstable-scylla-format.md>`_
+for the layout.
+
+Older Scylla versions skip unknown ``Scylla.db`` subcomponents. A version that
+can't read ``mu`` refuses ``mu`` SSTables because of the format version, and
+every version that can read ``mu`` checks ``incompatible_features``. Thus, the
+check is reliable for ``mu`` and later formats, but not for earlier formats. A
+writer must not set feature bits in an earlier format.
