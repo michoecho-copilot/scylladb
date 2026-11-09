@@ -1784,6 +1784,15 @@ protected:
             compaction_group_view& t = *_compacting_table;
             compaction_strategy cs = t.get_compaction_strategy();
             compaction_descriptor descriptor = co_await cs.get_sstables_for_compaction(t, _cm.get_strategy_control());
+            // A splice copies the sstables it moves, so it can't drop the data which cleanup has
+            // to drop. If any input requires cleanup, compact the runs instead. The splice's run
+            // identifier names one of the input runs, so the output gets a new one, as usual.
+            if (descriptor.options.type() == compaction_type::Splice
+                    && std::ranges::any_of(descriptor.sstables, [this] (const sstables::shared_sstable& sst) { return _compaction_state.requires_cleanup(sst); })) {
+                cmlog.debug("{}: compacting instead of splicing, since some sstables require cleanup", *this);
+                descriptor.options = compaction_type_options::make_regular();
+                descriptor.run_identifier = sstables::run_id::create_random_id();
+            }
             int weight = calculate_weight(descriptor);
             cmlog.debug("Started minor compaction sstables={} sstables_reapired_at={} range={} uuid={} compaction_uuid={}",
                     descriptor.sstables, compacting_table()->get_sstables_repaired_at(),
