@@ -14,6 +14,7 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/condition-variable.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/shared_future.hh>
 #include <seastar/core/metrics.hh>
@@ -229,6 +230,8 @@ private:
     // Holds the releases of counted references, which run in the background
     // on shard 0. close() waits for them.
     seastar::named_gate _table_storage_gate{"sstables_manager::table_storage"};
+    // Signalled when an sstable is destroyed.
+    seastar::condition_variable _sstable_destroyed;
 
     // Total reclaimable memory used by components of sstables in _active list
     size_t _total_reclaimable_memory{0};
@@ -416,6 +419,9 @@ public:
     // Waits until the storage of the table has no reference on any shard, and
     // the removal that the last reference started, if any, is done. For tests.
     future<> await_table_storage_unused(table_id id);
+    // Waits until every sstable that lost its last reference is destroyed.
+    // The files of a deleted sstable are removed by then. For tests.
+    future<> await_destroyed_sstables();
 
     std::vector<std::filesystem::path> get_local_directories(const data_dictionary::storage_options::local& so) const;
 

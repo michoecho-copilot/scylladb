@@ -1489,11 +1489,11 @@ future<> database::cleanup_drop_table_on_all_shards(sharded<database>& sharded_d
     // If the cleanup failed above, the storage of the table stays behind, as
     // it did before the removal was deferred.
     //
-    // Sstables of the table can be referenced outside of it, and the directory
-    // is removed only once they are destroyed. References can be held for an
-    // unbounded time. So the sstables manager removes the storage only once
-    // it has no user on any shard: here if it has none, otherwise when the
-    // last user releases it.
+    // Truncate deletes the sstables of the table, but the files of each are
+    // removed only when the last reference to it is dropped. References can
+    // be held outside of the table, for an unbounded time. So the sstables
+    // manager removes the storage only once it has no user on any shard:
+    // here if it has none, otherwise when the last user releases it.
     co_await table_shards->get_sstables_manager().drop_table_storage(id, table_shards->get_storage_options());
 }
 

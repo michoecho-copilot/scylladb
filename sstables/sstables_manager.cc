@@ -577,6 +577,7 @@ void sstables_manager::deactivate(sstable* sst) {
 void sstables_manager::remove(sstable* sst) {
     _undergoing_close.erase(_undergoing_close.iterator_to(*sst));
     delete sst;
+    _sstable_destroyed.broadcast();
     _components_memory_change_event.signal();
     maybe_done();
 }
@@ -756,6 +757,12 @@ future<> sstables_manager::await_table_storage_unused(table_id id) {
     }
     return _storage->container().invoke_on(0, [id] (storage_manager& sm) {
         return sm.await_table_storage_unused(id);
+    });
+}
+
+future<> sstables_manager::await_destroyed_sstables() {
+    return _sstable_destroyed.wait([this] {
+        return _undergoing_close.empty();
     });
 }
 
