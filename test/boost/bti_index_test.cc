@@ -14,12 +14,14 @@
 // are consistent with a "reference" index on the same dataset.
 
 #include <generator>
+#include <random>
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/testing/test_case.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/util/closeable.hh>
 #include <seastar/util/defer.hh>
+#include "sstables/checksum_utils.hh"
 #include "sstables/compress.hh"
 #include "sstables/framed_chunk.hh"
 #include "sstables/mx/types.hh"
@@ -340,6 +342,134 @@ SEASTAR_THREAD_TEST_CASE(test_mu_index_payload_encoding) {
         // position relative to the C field (-10) as a signed vint, the block
         // count, and the partition tombstone.
         "0002" "0002" "83e8" "2032" "13" "02" "00000000000003f3" "00000315");
+}
+
+// The CRC32 and the size of an index file.
+struct index_file_digest {
+    uint32_t crc;
+    size_t size;
+    bool operator==(const index_file_digest&) const = default;
+};
+
+static index_file_digest digest_of(const memory_data_sink_buffers& bufs) {
+    uint32_t crc = crc32_utils::init_checksum();
+    size_t size = 0;
+    for (const auto& frag : bufs.buffers()) {
+        crc = crc32_utils::checksum(crc, frag.get(), frag.size());
+        size += frag.size();
+    }
+    return {crc, size};
+}
+
+// Writes Partitions.db and Rows.db of the given (logical) format for a fixed,
+// pseudo-random set of partitions, and returns their digests.
+//
+// The set has short and long partition keys (some longer than a page), token
+// collisions, partitions with and without row indexes, long clustering keys and
+// range tombstones, so that the trie writer pads, splits subtrees and writes keys
+// across page boundaries.
+static std::pair<index_file_digest, index_file_digest> digest_fixed_index(sstables::sstable_version_types sst_ver) {
+    auto s = schema_builder(this_smp_shard_count(), "ks", "t")
+        .with_column("pk", utf8_type, column_kind::partition_key)
+        .with_column("ck", utf8_type, column_kind::clustering_key)
+        .build();
+    // A fixed generator, so that the input doesn't depend on the test seed.
+    // We use the raw engine output, because the standard distributions are
+    // implementation-defined.
+    std::mt19937_64 rng(1234567);
+    auto random_string = [&] (size_t max_len) {
+        size_t len = 1 + rng() % max_len;
+        std::string v(len, 'a');
+        for (auto& c : v) {
+            c = 'a' + rng() % 4;
+        }
+        return v;
+    };
+    auto pos = [] (uint64_t p) { return sstables::sstable_position::from_logical(p); };
+    memory_data_sink_buffers partitions_bufs;
+    memory_data_sink_buffers rows_bufs;
+    {
+        sstables::file_writer partitions_db_writer(data_sink(std::make_unique<memory_data_sink>(partitions_bufs)));
+        sstables::file_writer rows_db_writer(data_sink(std::make_unique<memory_data_sink>(rows_bufs)));
+        auto close_partitions_db = defer([&] noexcept { partitions_db_writer.close(); });
+        auto close_rows_db = defer([&] noexcept { rows_db_writer.close(); });
+        auto encoding = sstables::trie::bti_position_encoding::logical();
+        auto partition_index_writer = sstables::trie::bti_partition_index_writer(sst_ver, partitions_db_writer, encoding);
+        auto row_index_writer = sstables::trie::bti_row_index_writer(sst_ver, rows_db_writer, encoding);
+        std::optional<sstables::key> first_key;
+        std::optional<sstables::key> last_key;
+        int64_t token = std::numeric_limits<int64_t>::min() / 2;
+        int64_t last_token = token;
+        std::string last_pk_value;
+        uint64_t data_pos = 0;
+        for (int i = 0; i < 20000; ++i) {
+            // Token collisions in 1 of 16 cases, small token gaps in most others.
+            if (i == 0 || rng() % 16) {
+                token += 1 + (rng() % 8 ? rng() % 1000 : rng() % (uint64_t(1) << 50));
+            }
+            auto pk_value = random_string(rng() % 64 ? 20 : 6000);
+            if (token == last_token && pk_value <= last_pk_value) {
+                // Keys with the same token must be sorted.
+                continue;
+            }
+            auto pk = partition_key::from_single_value(*s, to_bytes(pk_value));
+            auto dk = dht::decorated_key(dht::token::from_int64(token), pk);
+            auto key = sstables::key::from_partition_key(*s, pk);
+            last_token = token;
+            last_pk_value = pk_value;
+            uint64_t partition_start = data_pos;
+            data_pos += 1 + rng() % 200;
+            if (rng() % 4 == 0) {
+                size_t n_blocks = 1 + rng() % 30;
+                std::vector<std::string> cks;
+                for (size_t b = 0; b < 2 * n_blocks; ++b) {
+                    cks.push_back(random_string(rng() % 32 ? 30 : 3000));
+                }
+                std::ranges::sort(cks);
+                auto [first, last] = std::ranges::unique(cks);
+                cks.erase(first, last);
+                for (size_t b = 0; b + 1 < cks.size(); b += 2) {
+                    auto make_ck = [&] (const std::string& v) {
+                        return sstables::clustering_info{
+                            clustering_key::from_single_value(*s, to_bytes(v)),
+                            sstables::bound_kind_m::clustering};
+                    };
+                    auto rt = rng() % 8 == 0
+                        ? sstables::deletion_time{int32_t(rng() % 100000), int64_t(rng() % 100000)}
+                        : sstables::deletion_time::make_live();
+                    row_index_writer.add(*s, make_ck(cks[b]), make_ck(cks[b + 1]), pos(partition_start), pos(data_pos), rt);
+                    data_pos += 1 + rng() % 70000;
+                }
+            }
+            auto partition_tombstone = rng() % 8 == 0
+                ? sstables::deletion_time{int32_t(rng() % 100000), int64_t(rng() % 100000)}
+                : sstables::deletion_time::make_live();
+            auto target = row_index_writer.finish(*s, pos(partition_start), pos(data_pos), key, partition_tombstone);
+            data_pos += 1;
+            partition_index_writer.add(*s, dk, utils::make_hashed_key(bytes_view(key)), target);
+            if (!first_key) {
+                first_key = key;
+            }
+            last_key = key;
+        }
+        std::move(partition_index_writer).finish(*first_key, *last_key);
+    }
+    return {digest_of(partitions_bufs), digest_of(rows_bufs)};
+}
+
+// `ms` and `mt` index files must not change. Their digests were computed with
+// the writers from before the `mu` page footers were added.
+SEASTAR_THREAD_TEST_CASE(test_ms_mt_index_digests_unchanged) {
+    for (auto [sst_ver, expected_partitions, expected_rows] : {
+        std::tuple{sstables::sstable_version_types::ms, index_file_digest{0xd5ea868c, 195859}, index_file_digest{0xc3477c5e, 1122607}},
+        std::tuple{sstables::sstable_version_types::mt, index_file_digest{0xd5ea868c, 195859}, index_file_digest{0xc3477c5e, 1122607}},
+    }) {
+        auto [partitions, rows] = digest_fixed_index(sst_ver);
+        testlog.info("{}: Partitions.db crc={:#x} size={}, Rows.db crc={:#x} size={}",
+            sst_ver, partitions.crc, partitions.size, rows.crc, rows.size);
+        BOOST_CHECK(partitions == expected_partitions);
+        BOOST_CHECK(rows == expected_rows);
+    }
 }
 
 struct clustering_index_entry {
