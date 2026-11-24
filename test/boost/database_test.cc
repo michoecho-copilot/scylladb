@@ -1963,6 +1963,110 @@ SEASTAR_TEST_CASE(recreate_dropped_table_with_held_sstables) {
     }, false, cfg);
 }
 
+// Checks that clear_snapshot() leaves the directory of a dropped table while
+// sstables of the table are still referenced, also when the drop failed after
+// truncate, so that no removal of the storage of the table is pending.
+SEASTAR_TEST_CASE(clear_snapshot_of_failed_drop_with_held_sstables) {
+#ifndef SCYLLA_ENABLE_ERROR_INJECTION
+    testlog.debug("Skipping test as it depends on error injection. Please run in mode where it's enabled (debug,dev).\n");
+    co_return;
+#endif
+    sstring ks_name = "ks";
+    sstring table_name = "failed_drop_table";
+    tmpdir data_dir;
+    auto cfg = make_shared<db::config>();
+    cfg->data_file_directories({data_dir.path().string()}, db::config::config_source::CommandLine);
+    cfg->auto_snapshot.set(false);
+
+    co_await do_with_some_data({table_name}, [&] (cql_test_env& e) -> future<> {
+        auto& cf = e.local_db().find_column_family(ks_name, table_name);
+        auto cf_dir = table_dir(cf).native();
+        auto id = cf.schema()->id();
+        co_await replica::database::flush_table_on_all_shards(e.db(), ks_name, table_name);
+        using held_sstables = foreign_ptr<lw_shared_ptr<utils::chunked_vector<sstables::shared_sstable>>>;
+        auto held = co_await e.db().map([&] (replica::database& db) -> future<held_sstables> {
+            auto& cf = db.find_column_family(ks_name, table_name);
+            co_return make_foreign(make_lw_shared(co_await cf.take_sstable_set_snapshot()));
+        });
+        BOOST_REQUIRE(std::ranges::any_of(held, [] (const held_sstables& ssts) { return !ssts->empty(); }));
+
+        utils::get_local_injector().enable("cleanup_drop_table_fail", true);
+        auto dropped = co_await coroutine::as_future(replica::database::legacy_drop_table_on_all_shards(e.db(), e.get_system_keyspace(), ks_name, table_name, false));
+        BOOST_REQUIRE(dropped.failed());
+        dropped.ignore_ready_future();
+
+        co_await e.local_db().clear_snapshot("", {ks_name}, table_name);
+        BOOST_REQUIRE(co_await file_exists(cf_dir));
+
+        co_await parallel_for_each(held, [] (held_sstables& ssts) {
+            return smp::submit_to(ssts.get_owner_shard(), [&ssts] {
+                ssts->clear();
+            });
+        });
+        co_await e.local_db().await_table_storage_unused(id);
+        // The drop failed, so the storage is not marked as dropped, and its
+        // last user left the directory.
+        BOOST_REQUIRE(co_await file_exists(cf_dir));
+        co_await e.local_db().clear_snapshot("", {ks_name}, table_name);
+        BOOST_REQUIRE(!co_await file_exists(cf_dir));
+    }, false, cfg);
+}
+
+// Checks that clear_snapshot() leaves the directory of a table that is
+// dropped but not stopped yet, and that the table can still flush. Drop table
+// removes the table from the metadata before it truncates and stops it, and
+// clear_snapshot() sees the table as dropped from then on.
+SEASTAR_TEST_CASE(clear_snapshot_during_drop_table_cleanup) {
+#ifndef SCYLLA_ENABLE_ERROR_INJECTION
+    testlog.debug("Skipping test as it depends on error injection. Please run in mode where it's enabled (debug,dev).\n");
+    co_return;
+#endif
+    sstring ks_name = "ks";
+    sstring table_name = "dropped_running_table";
+    tmpdir data_dir;
+    auto cfg = make_shared<db::config>();
+    cfg->data_file_directories({data_dir.path().string()}, db::config::config_source::CommandLine);
+    cfg->auto_snapshot.set(false);
+
+    co_await do_with_some_data({table_name}, [&] (cql_test_env& e) -> future<> {
+        auto& cf = e.local_db().find_column_family(ks_name, table_name);
+        auto cf_dir = table_dir(cf).native();
+        auto id = cf.schema()->id();
+        // The table is not found by name once it is dropped, so hold it.
+        auto tables = co_await e.db().map([&] (replica::database& db) {
+            return make_foreign(db.find_column_family(ks_name, table_name).shared_from_this());
+        });
+
+        static constexpr auto injection = "cleanup_drop_table_wait";
+        utils::get_local_injector().enable(injection);
+        auto dropped = replica::database::legacy_drop_table_on_all_shards(e.db(), e.get_system_keyspace(), ks_name, table_name, false);
+        while (utils::get_local_injector().enter_count(injection) == 0) {
+            co_await seastar::yield();
+        }
+        // The table is dropped from the metadata, but still running.
+        BOOST_REQUIRE_THROW(e.local_db().find_column_family(ks_name, table_name), data_dictionary::no_such_column_family);
+        co_await e.local_db().clear_snapshot("", {ks_name}, table_name);
+        BOOST_REQUIRE(co_await file_exists(cf_dir));
+
+        // do_with_some_data() wrote rows that are not flushed yet.
+        co_await parallel_for_each(tables, [] (auto& t) {
+            return smp::submit_to(t.get_owner_shard(), [&t] { return t->flush(); });
+        });
+        auto sstables = co_await map_reduce(tables, [] (auto& t) {
+            return smp::submit_to(t.get_owner_shard(), [&t] { return t->sstables_count(); });
+        }, size_t(0), std::plus<size_t>());
+        BOOST_REQUIRE(sstables > 0);
+        BOOST_REQUIRE(co_await file_exists(cf_dir));
+
+        utils::get_local_injector().receive_message(injection);
+        co_await std::move(dropped);
+        utils::get_local_injector().disable(injection);
+        tables.clear();
+        co_await e.local_db().await_table_storage_unused(id);
+        BOOST_REQUIRE(!co_await file_exists(cf_dir));
+    }, false, cfg);
+}
+
 SEASTAR_TEST_CASE(mutation_dump_generated_schema_deterministic_id_version) {
     simple_schema s;
     auto os1 = replica::mutation_dump::generate_output_schema_from_underlying_schema(s.schema());

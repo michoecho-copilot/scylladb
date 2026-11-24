@@ -3659,14 +3659,29 @@ future<> database::clear_snapshot(sstring tag, std::vector<sstring> keyspace_nam
                         auto id_opt = _tables_metadata.get_table_id_if_exists(std::make_pair(ks_name, cf_name));
                         auto dropped = !id_opt || (cf_uuid != id_opt);
                         if (dropped) {
-                            dblog.info("Removing dropped table dir {}", table_dir);
-                            sstables::remove_table_directory_if_has_no_snapshots(table_dir).get();
+                            remove_dropped_table_dir(cf_uuid, table_dir).get();
                         }
                     }
                 }
             }
         });
     });
+}
+
+future<> database::remove_dropped_table_dir(table_id id, fs::path table_dir) {
+    // The users of the storage of every table are tracked in one place, so
+    // any sstables manager can ask.
+    auto unused = co_await get_user_sstables_manager().remove_table_directory_if_unused(id, table_dir);
+    if (!unused) {
+        // The table may still be running: drop table removes it from the
+        // metadata before it truncates and stops it. Or callers may still
+        // hold sstables of the table, and need their files. Drop table marks
+        // the storage as dropped once the table is stopped, and the last
+        // user removes the directory then. No other clear_snapshot() is
+        // needed for that. Only if drop table failed, the directory stays
+        // until a later clear_snapshot().
+        dblog.info("Leaving dropped table dir {} behind, because its storage is in use", table_dir);
+    }
 }
 
 future<> database::flush_non_system_column_families() {

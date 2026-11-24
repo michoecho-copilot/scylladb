@@ -2321,6 +2321,11 @@ public:
     // see sstables::sstables_manager::open_table_storage(). The table object
     // takes the returned reference, see add_column_family().
     future<sstables::table_storage_ptr> open_table_storage(const schema& s, const data_dictionary::storage_options& keyspace_so);
+private:
+    // Removes the directory of a dropped table for clear_snapshot(), unless
+    // the storage of the table has a user on some shard.
+    future<> remove_dropped_table_dir(table_id id, std::filesystem::path table_dir);
+public:
 
     const dirty_memory_manager_logalloc::region_group& dirty_memory_region_group() const {
         return _dirty_memory_manager.region_group();
