@@ -537,6 +537,13 @@ static bool belongs_to_other_shard(const std::vector<shard_id>& shards) {
     return shards.size() != size_t(belongs_to_current_shard(shards));
 }
 
+sstables::table_storage_ptr table::get_table_storage() const {
+    if (!_storage) {
+        throw no_such_column_family(_schema->id());
+    }
+    return _storage;
+}
+
 sstables::shared_sstable table::make_sstable(sstables::sstable_state state) {
     auto& sstm = get_sstables_manager();
     return make_sstable(state, sstm.get_preferred_sstable_version());
@@ -549,7 +556,7 @@ sstables::shared_sstable table::make_sstable(sstables::sstable_state state, ssta
     if (_storage_opts->is_object_storage_type()) {
         sid_opt = sstables::sstable_id(gen.as_uuid());
     }
-    return sstm.make_sstable(_schema, *_storage_opts, gen, sid_opt, state, version, sstables::sstable::format_types::big);
+    return sstm.make_sstable(_schema, get_table_storage(), gen, sid_opt, state, version, sstables::sstable::format_types::big);
 }
 
 sstables::shared_sstable table::make_sstable() {
@@ -2376,8 +2383,8 @@ table::stop() noexcept {
     }
     _cache.refresh_snapshot();
     // The writers of the table are drained, so it no longer uses its storage.
-    // If stop() fails before this, the destructor of the table releases the
-    // reference.
+    // Its sstables still do, until they are destroyed. If stop() fails before
+    // this, the destructor of the table releases the reference.
     _storage = nullptr;
 }
 static seastar::metrics::label_instance node_table_metrics("__per_table", "node");

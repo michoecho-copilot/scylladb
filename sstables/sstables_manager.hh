@@ -278,8 +278,12 @@ public:
             storage_manager* shared = nullptr);
     virtual ~sstables_manager();
 
+    // Makes an sstable object of the table, in the given storage. The
+    // sstable holds the reference, so its storage stays in place while it
+    // lives. A table gives out its reference with get_table_storage(). Code
+    // that works without a table uses attach_table_storage().
     shared_sstable make_sstable(schema_ptr schema,
-            const data_dictionary::storage_options& storage,
+            table_storage_ptr storage,
             generation_type generation,
             optimized_optional<sstable_id> sstable_identifier,
             sstable_state state = sstable_state::normal,
@@ -289,7 +293,7 @@ public:
             io_error_handler_gen error_handler_gen = default_io_error_handler_gen(),
             size_t buffer_size = default_sstable_buffer_size);
     shared_sstable make_sstable(schema_ptr schema,
-            const data_dictionary::storage_options& storage,
+            table_storage_ptr storage,
             generation_type generation,
             sstable_state state = sstable_state::normal,
             sstable_version_types v = get_highest_sstable_version(),
@@ -297,7 +301,7 @@ public:
             db_clock::time_point now = db_clock::now(),
             io_error_handler_gen error_handler_gen = default_io_error_handler_gen(),
             size_t buffer_size = default_sstable_buffer_size) {
-        return make_sstable(std::move(schema), storage, generation, std::nullopt, state, v, f, now, std::move(error_handler_gen), buffer_size);
+        return make_sstable(std::move(schema), std::move(storage), generation, std::nullopt, state, v, f, now, std::move(error_handler_gen), buffer_size);
     }
 
     shared_ptr<object_storage_client> get_endpoint_client(sstring endpoint) const {
@@ -394,9 +398,11 @@ public:
     future<table_storage_ptr> open_table_storage(const schema& s, const data_dictionary::storage_options& keyspace_so);
     // Returns a reference to storage that the caller creates and removes on
     // its own. It doesn't keep the storage in place. For tests and tools,
-    // which work without a database, and for tables that never write
-    // sstables.
+    // which work without a database, for tables that never write sstables,
+    // and for sstables that live outside the storage of their table, like
+    // the ones that a restore reads from a backup.
     table_storage_ptr attach_table_storage(const schema& s, lw_shared_ptr<const data_dictionary::storage_options> so);
+    table_storage_ptr attach_table_storage(const schema& s, data_dictionary::storage_options so);
     // Tells that the table was dropped, so its storage must be removed. The
     // storage is removed once it has no reference on any shard: before this
     // returns if it has none, otherwise in the background, by whoever

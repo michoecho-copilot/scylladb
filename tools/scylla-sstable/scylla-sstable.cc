@@ -669,7 +669,7 @@ const std::vector<sstables::shared_sstable> load_sstables(schema_ptr schema, sst
             const auto dir_path = sst_path.parent_path();
             options = data_dictionary::make_local_options(dir_path);
         }
-        auto sst = sst_man.make_sstable(schema, options, ed->generation, ed->sid, sstables::sstable_state::normal, ed->version, ed->format);
+        auto sst = sst_man.make_sstable(schema, sst_man.attach_table_storage(*schema, options), ed->generation, ed->sid, sstables::sstable_state::normal, ed->version, ed->format);
 
         try {
             auto open_cfg = sstables::sstable_open_config{
@@ -1095,7 +1095,7 @@ private:
             throw std::runtime_error(fmt::format("cannot create output sstable {}, file already exists", sst_name));
         }
         auto local = data_dictionary::make_local_options(_output_dir);
-        return _sst_man.make_sstable(_schema, local, generation, sstables::sstable_state::normal, version, format);
+        return _sst_man.make_sstable(_schema, _sst_man.attach_table_storage(*_schema, local), generation, sstables::sstable_state::normal, version, format);
     }
     sstables::sstable_writer_config do_configure_writer(sstring origin) const {
         return _sst_man.configure_writer(std::move(origin));
@@ -2317,7 +2317,7 @@ void write_operation(schema_ptr schema, reader_permit permit, const std::vector<
         auto writer_cfg = manager.configure_writer("scylla-sstable");
         writer_cfg.validation_level = validation_level;
         auto local = data_dictionary::make_local_options(output_dir);
-        auto sst = manager.make_sstable(schema, local, generation, sstables::sstable_state::normal, version, format);
+        auto sst = manager.make_sstable(schema, manager.attach_table_storage(*schema, local), generation, sstables::sstable_state::normal, version, format);
 
         co_await sst->write_components(std::move(reader), partition_count_estimate, schema, writer_cfg, encoding_stats{});
 
@@ -2433,7 +2433,7 @@ void shard_of_with_vnodes(const std::vector<sstables::shared_sstable>& sstables,
             shard_count, ignore_msb_bits).build();
         auto new_sst = sstable_manager.make_sstable(
             schema,
-            data_dictionary::make_local_options(fs::path(sst->get_storage().prefix())),
+            sstable_manager.attach_table_storage(*schema, data_dictionary::make_local_options(fs::path(sst->get_storage().prefix()))),
             sst->generation(),
             sstable_state::normal,
             sst->get_version());
@@ -2642,7 +2642,7 @@ void upgrade_operation(schema_ptr schema, reader_permit permit, const std::vecto
         const auto new_generation = sstables::generation_type(utils::UUID_gen::get_time_UUID());
 
         auto writer_cfg = sst_man.configure_writer("scylla-sstable");
-        auto new_sst = sst_man.make_sstable(schema, local, new_generation, sstables::sstable_state::normal, new_version, new_format);
+        auto new_sst = sst_man.make_sstable(schema, sst_man.attach_table_storage(*schema, local), new_generation, sstables::sstable_state::normal, new_version, new_format);
 
         new_sst->write_components(
                 sst->make_full_scan_reader(schema, permit),
@@ -2735,7 +2735,7 @@ void filter_operation(schema_ptr schema, reader_permit permit, const std::vector
         const auto new_generation = sstables::generation_type(utils::UUID_gen::get_time_UUID());
 
         auto writer_cfg = sst_man.configure_writer("scylla-sstable");
-        auto new_sst = sst_man.make_sstable(schema, local, new_generation, sstables::sstable_state::normal, new_version, new_format);
+        auto new_sst = sst_man.make_sstable(schema, sst_man.attach_table_storage(*schema, local), new_generation, sstables::sstable_state::normal, new_version, new_format);
 
         new_sst->write_components(
                 std::move(reader),
@@ -2804,7 +2804,7 @@ void split_operation(schema_ptr schema, reader_permit permit, const std::vector<
 
         auto consumer = [&] (mutation_reader reader) -> future<> {
             const auto new_generation = sstables::generation_type(utils::UUID_gen::get_time_UUID());
-            auto new_sst = sst_man.make_sstable(schema, local, new_generation, sstables::sstable_state::normal, new_version, new_format);
+            auto new_sst = sst_man.make_sstable(schema, sst_man.attach_table_storage(*schema, local), new_generation, sstables::sstable_state::normal, new_version, new_format);
 
             auto writer_cfg = sst_man.configure_writer("scylla-sstable");
 

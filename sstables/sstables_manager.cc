@@ -406,7 +406,7 @@ locator::host_id sstables_manager::get_local_host_id() const {
 }
 
 shared_sstable sstables_manager::make_sstable(schema_ptr schema,
-        const data_dictionary::storage_options& storage,
+        table_storage_ptr storage,
         generation_type generation,
         optimized_optional<sstable_id> sid,
         sstable_state state,
@@ -415,7 +415,10 @@ shared_sstable sstables_manager::make_sstable(schema_ptr schema,
         db_clock::time_point now,
         io_error_handler_gen error_handler_gen,
         size_t buffer_size) {
-    return make_lw_shared<sstable>(std::move(schema), storage, generation, sid, state, v, f, get_large_data_handler(), get_corrupt_data_handler(), *this, now, std::move(error_handler_gen), buffer_size);
+    if (!storage) {
+        on_internal_error(smlogger, format("Making an sstable of table {} without a reference to its storage", schema->id()));
+    }
+    return make_lw_shared<sstable>(std::move(schema), std::move(storage), generation, sid, state, v, f, get_large_data_handler(), get_corrupt_data_handler(), *this, now, std::move(error_handler_gen), buffer_size);
 }
 
 sstable_writer_config sstables_manager::configure_writer(sstring origin) const {
@@ -639,11 +642,13 @@ future<> sstables_manager::init_keyspace_storage(const data_dictionary::storage_
     return sstables::init_keyspace_storage(*this, so, dir);
 }
 
-table_storage::table_storage(sstables_manager& manager, table_id id, lw_shared_ptr<const data_dictionary::storage_options> options, bool counted)
+table_storage::table_storage(sstables_manager& manager, table_id id, lw_shared_ptr<const data_dictionary::storage_options> options, bool counted,
+        table_storage_ptr parent)
     : _manager(manager)
     , _id(id)
     , _options(std::move(options))
     , _counted(counted)
+    , _parent(std::move(parent))
 {
 }
 
@@ -651,6 +656,10 @@ table_storage::~table_storage() {
     if (_counted) {
         _manager.release_table_storage(_id);
     }
+}
+
+table_storage_ptr table_storage::with_options(lw_shared_ptr<const data_dictionary::storage_options> options) {
+    return make_lw_shared<table_storage>(_manager, _id, std::move(options), false, _parent ? _parent : shared_from_this());
 }
 
 void sstables_manager::release_table_storage(table_id id) noexcept {
@@ -710,6 +719,10 @@ future<table_storage_ptr> sstables_manager::open_table_storage(const schema& s, 
 
 table_storage_ptr sstables_manager::attach_table_storage(const schema& s, lw_shared_ptr<const data_dictionary::storage_options> so) {
     return make_lw_shared<table_storage>(*this, s.id(), std::move(so), false);
+}
+
+table_storage_ptr sstables_manager::attach_table_storage(const schema& s, data_dictionary::storage_options so) {
+    return attach_table_storage(s, make_lw_shared<const data_dictionary::storage_options>(std::move(so)));
 }
 
 future<> sstables_manager::drop_table_storage(table_id id, const data_dictionary::storage_options& table_so) {

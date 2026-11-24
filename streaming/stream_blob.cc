@@ -65,7 +65,7 @@ static future<> load_sstable_for_tablet(const file_stream_id& ops_id, replica::d
         // co_await below. A suspension inserted between these two lines reopens the race.
         auto table_stream_op = t.stream_in_progress();
         auto& sstm = t.get_sstables_manager();
-        auto sst = sstm.make_sstable(t.schema(), t.get_storage_options(), desc.generation, desc.sid, state, desc.version, desc.format);
+        auto sst = sstm.make_sstable(t.schema(), t.get_table_storage(), desc.generation, desc.sid, state, desc.version, desc.format);
         sstables::sstable_open_config cfg {
             .current_shard_as_sstable_owner = true,
             .unsealed_sstable = true,
@@ -477,7 +477,7 @@ future<> stream_blob_handler(replica::database& db, db::view::view_building_work
             if (!desc_result) {
                 throw std::runtime_error(fmt::format("Cannot stream blob in {}.{}: file={}: {}", schema->ks_name(), schema->cf_name(), meta.filename, desc_result.error()));
             }
-            auto sstable_sink = sstables::create_stream_sink(table.schema(), sstm, table.get_storage_options(), sstable_state(meta), *desc_result, cfg);
+            auto sstable_sink = sstables::create_stream_sink(table.schema(), sstm, table.get_table_storage(), sstable_state(meta), *desc_result, cfg);
             auto out = co_await sstable_sink->output(foptions, stream_options);
             co_return output_result{
                 [sstable_sink = std::move(sstable_sink), &meta, &db, &vbw](store_result res) -> future<> {
@@ -956,7 +956,7 @@ future<stream_files_response> clone_sstable_handler(replica::database& db, db::v
     replica::table& t = db.find_column_family(req.table);
     auto table_stream_op = t.stream_in_progress();
     auto& sstm = t.get_sstables_manager();
-    auto orig_sst = sstm.make_sstable(t.schema(), t.get_storage_options(), generation, meta.id, state, version, format);
+    auto orig_sst = sstm.make_sstable(t.schema(), t.get_table_storage(), generation, meta.id, state, version, format);
     bool use_reference_sharing = features.sstable_reference_sharing;
     if (!use_reference_sharing) {
         // The copy path only needs the component list (from the TOC) so that

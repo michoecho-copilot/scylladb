@@ -93,7 +93,7 @@ future<minimal_sst_info> download_sstable(replica::table& table, sstables::share
             auto sstable_sink =
                 sstables::create_stream_sink(table.schema(),
                                              table.get_sstables_manager(),
-                                             table.get_storage_options(),
+                                             table.get_table_storage(),
                                              sstables::sstable_state::normal,
                                              descriptor,
                                              sstables::sstable_stream_sink_cfg{.last_component = std::next(it) == components.cend(), .leave_unsealed = true});

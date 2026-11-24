@@ -202,7 +202,7 @@ distributed_loader::process_upload_dir(sharded<replica::database>& db, sharded<d
             auto& sstm = global_table->get_sstables_manager();
             auto& gen = global_table->get_sstable_generation_generator();
             auto generation = gen();
-            return sstm.make_sstable(global_table->schema(), global_table->get_storage_options(),
+            return sstm.make_sstable(global_table->schema(), global_table->get_table_storage(),
                                      generation, sstables::sstable_state::upload, sstm.get_preferred_sstable_version(),
                                      sstables::sstable_format_types::big, db_clock::now(), &error_handler_gen_for_upload_dir);
         };
@@ -372,9 +372,11 @@ future<> table_populator::collect_subdirs(const data_dictionary::storage_options
     co_await coroutine::parallel_for_each(datadirs, [&] (const std::filesystem::path& datadir) -> future<> {
         auto dptr = make_lw_shared<sharded<sstables::sstable_directory>>();
         co_await dptr->start(_global_table.as_sharded_parameter(), state,
-                        sharded_parameter([datadir] {
+                        sharded_parameter([this, datadir] {
+                            // The sstables in every data directory keep the
+                            // storage of the table in place.
                             auto opts = data_dictionary::make_local_options(datadir);
-                            return make_lw_shared<const data_dictionary::storage_options>(std::move(opts));
+                            return _global_table->get_table_storage()->with_options(make_lw_shared<const data_dictionary::storage_options>(std::move(opts)));
                         }), default_io_error_handler_gen());
         _sstable_directories.push_back(std::move(dptr));
     });
@@ -417,7 +419,7 @@ future<> table_populator::process_subdir(sharded<sstables::sstable_directory>& d
 }
 
 sstables::shared_sstable make_sstable(replica::table& table, sstables::sstable_state state, sstables::generation_type generation, sstables::sstable_version_types v) {
-    return table.get_sstables_manager().make_sstable(table.schema(), table.get_storage_options(), generation, state, v, sstables::sstable_format_types::big);
+    return table.get_sstables_manager().make_sstable(table.schema(), table.get_table_storage(), generation, state, v, sstables::sstable_format_types::big);
 }
 
 future<> table_populator::populate_subdir(sharded<sstables::sstable_directory>& directory) {

@@ -6589,7 +6589,7 @@ void sstable_clone_leaving_unsealed_dest_sstable_fn(test_env& env) {
     auto d = sst->clone(gen_generator(), leave_unsealed).get();
     BOOST_REQUIRE(d.state == sst->state());
 
-    auto sst2 = table->get_sstables_manager().make_sstable(s, table->get_storage_options(), d.generation, d.state.value(), d.version, d.format);
+    auto sst2 = table->get_sstables_manager().make_sstable(s, table->get_table_storage(), d.generation, d.state.value(), d.version, d.format);
     sst2->load(s->get_sharder(), sstable_open_config{ .unsealed_sstable = leave_unsealed }).get();
     BOOST_REQUIRE(!sst2->get_storage().exists(*sst2, sstables::component_type::TOC).get());
     BOOST_REQUIRE(sst2->get_storage().exists(*sst2, sstables::component_type::TemporaryTOC).get());
@@ -6598,7 +6598,7 @@ void sstable_clone_leaving_unsealed_dest_sstable_fn(test_env& env) {
     d = sst->clone(gen_generator(), leave_unsealed).get();
     BOOST_REQUIRE(d.state == sst->state());
 
-    auto sst3 = table->get_sstables_manager().make_sstable(s, table->get_storage_options(), d.generation, d.state.value(), d.version, d.format);
+    auto sst3 = table->get_sstables_manager().make_sstable(s, table->get_table_storage(), d.generation, d.state.value(), d.version, d.format);
     sst3->load(s->get_sharder(), sstable_open_config{ .unsealed_sstable = leave_unsealed }).get();
     BOOST_REQUIRE(sst3->get_storage().exists(*sst3, sstables::component_type::TOC).get());
     BOOST_REQUIRE(!sst3->get_storage().exists(*sst3, sstables::component_type::TemporaryTOC).get());

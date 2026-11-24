@@ -36,6 +36,7 @@
 #include "utils/observable.hh"
 #include "sstables/shareable_components.hh"
 #include "sstables/storage.hh"
+#include "sstables/table_storage.hh"
 #include "sstables/generation_type.hh"
 #include "sstables/types.hh"
 #include "sstables/checksummed_data_source.hh"
@@ -211,7 +212,7 @@ public:
     using manager_set_link_type = bi::set_member_hook<bi::link_mode<bi::auto_unlink>>;
 public:
     sstable(schema_ptr schema,
-            const data_dictionary::storage_options& storage,
+            table_storage_ptr storage,
             generation_type generation,
             optimized_optional<sstable_id> sstable_identifier,
             sstable_state state,
@@ -607,6 +608,9 @@ private:
     sstable_enabled_features _features = {};
 
     std::unique_ptr<storage> _storage;
+    // Keeps the storage of the table in place while the sstable lives, see
+    // table_storage.
+    table_storage_ptr _table_storage;
 
     const version_types _version;
     const format_types _format;
@@ -1437,7 +1441,7 @@ struct sstable_stream_sink_cfg {
 
 // Creates a sink object which can receive a component file sourced from above source object data.
 
-std::unique_ptr<sstable_stream_sink> create_stream_sink(schema_ptr, sstables_manager&, const data_dictionary::storage_options&, sstable_state, const entry_descriptor& desc, sstable_stream_sink_cfg cfg);
+std::unique_ptr<sstable_stream_sink> create_stream_sink(schema_ptr, sstables_manager&, table_storage_ptr, sstable_state, const entry_descriptor& desc, sstable_stream_sink_cfg cfg);
 
 } // namespace sstables
 

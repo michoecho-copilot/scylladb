@@ -18,6 +18,7 @@
 #include <functional>
 #include "seastarx.hh"
 #include "sstables/shared_sstable.hh"            // sstables::shared_sstable
+#include "sstables/table_storage.hh"
 #include "sstables/version.hh"                   // sstable versions
 #include "data_dictionary/storage_options.hh"
 #include "sstables/open_info.hh"                 // for entry_descriptor and foreign_sstable_open_info, chunked_vector wants to know if they are move constructible
@@ -198,6 +199,10 @@ private:
 
     sstables_manager& _manager;
     schema_ptr _schema;
+    // Where the sstables of the directory live. The sstables that the
+    // directory makes hold it, or a reference derived from it.
+    table_storage_ptr _table_storage;
+    // The options of _table_storage.
     lw_shared_ptr<const data_dictionary::storage_options> _storage_opts;
     sstable_state _state;
     io_error_handler_gen _error_handler_gen;
@@ -231,19 +236,19 @@ private:
 
     future<> process_descriptor(sstables::entry_descriptor desc,
             process_flags flags,
-            noncopyable_function<data_dictionary::storage_options()>&& get_storage_options);
+            noncopyable_function<table_storage_ptr()>&& get_storage);
     future<> do_process_descriptor(sstables::entry_descriptor desc,
             process_flags flags,
-            noncopyable_function<data_dictionary::storage_options()>&& get_storage_options);
+            noncopyable_function<table_storage_ptr()>&& get_storage);
     void validate(sstables::shared_sstable sst, process_flags flags) const;
     future<sstables::shared_sstable> load_sstable(sstables::entry_descriptor desc,
-            const data_dictionary::storage_options& storage_opts, sstables::sstable_open_config cfg = {}) const;
+            table_storage_ptr storage, sstables::sstable_open_config cfg = {}) const;
 
     future<> load_foreign_sstables(sstable_entry_descriptor_vector info_vec);
 
     // Compute owner of shards for a particular SSTable.
     future<std::vector<shard_id>> get_shards_for_this_sstable(
-            const sstables::entry_descriptor& desc, const data_dictionary::storage_options& storage_opts, process_flags flags) const;
+            const sstables::entry_descriptor& desc, table_storage_ptr storage, process_flags flags) const;
 
 public:
     // Scans wherever the given storage options put the sstables of the table:
@@ -255,13 +260,23 @@ public:
           lw_shared_ptr<const data_dictionary::storage_options> storage_opts,
           sstable_state state,
           io_error_handler_gen error_handler_gen);
+    // Scans wherever the options of the given reference put the sstables.
+    // The sstables that the directory makes hold the reference.
+    sstable_directory(sstables_manager& manager,
+          schema_ptr schema,
+          std::variant<std::unique_ptr<dht::sharder>, const dht::sharder*> sharder,
+          table_storage_ptr storage,
+          sstable_state state,
+          io_error_handler_gen error_handler_gen);
+    // Scans the storage of the table.
     sstable_directory(replica::table& table,
             sstable_state state,
             io_error_handler_gen error_handler_gen);
     sstable_directory(replica::table& table,
             sstable_state state,
-            lw_shared_ptr<const data_dictionary::storage_options> storage_opts,
+            table_storage_ptr storage,
             io_error_handler_gen error_handler_gen);
+    // Scans the given sstables in storage outside the table, like a backup.
     sstable_directory(replica::table& table,
             lw_shared_ptr<const data_dictionary::storage_options> storage_opts,
             std::vector<sstring> sstables,

@@ -916,6 +916,12 @@ private:
 public:
     const storage_options& get_storage_options() const noexcept { return *_storage_opts; }
     lw_shared_ptr<const storage_options> get_storage_options_ptr() const noexcept { return _storage_opts; }
+    // The reference that keeps the storage of the table in place, see
+    // sstables::table_storage. Whoever makes an sstable of the table passes
+    // it to sstables_manager::make_sstable(). Throws no_such_column_family
+    // once the table is stopped: its storage may be removed then, so no
+    // sstable can be added to it.
+    sstables::table_storage_ptr get_table_storage() const;
 
     seastar::named_gate& async_gate() { return _async_gate; }
 

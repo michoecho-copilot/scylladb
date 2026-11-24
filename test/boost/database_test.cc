@@ -1912,6 +1912,57 @@ SEASTAR_TEST_CASE(drop_table_with_explicit_snapshot) {
     });
 }
 
+// Checks that creating a table with the ID of a dropped table, as restoring
+// the schema.cql of a snapshot does, doesn't wait for the removal of the
+// storage of the dropped table, which waits until every sstable of the
+// dropped table is released. Both tables use the same directory. The removal
+// finds the table open again, and leaves the directory to the new table.
+SEASTAR_TEST_CASE(recreate_dropped_table_with_held_sstables) {
+    sstring ks_name = "ks";
+    sstring table_name = "recreated_table";
+    tmpdir data_dir;
+    auto cfg = make_shared<db::config>();
+    cfg->data_file_directories({data_dir.path().string()}, db::config::config_source::CommandLine);
+    cfg->auto_snapshot.set(false);
+
+    co_await do_with_some_data({table_name}, [&] (cql_test_env& e) -> future<> {
+        auto& cf = e.local_db().find_column_family(ks_name, table_name);
+        auto cf_dir = table_dir(cf).native();
+        auto id = cf.schema()->id();
+        co_await replica::database::flush_table_on_all_shards(e.db(), ks_name, table_name);
+        using held_sstables = foreign_ptr<lw_shared_ptr<utils::chunked_vector<sstables::shared_sstable>>>;
+        auto held = co_await e.db().map([&] (replica::database& db) -> future<held_sstables> {
+            auto& cf = db.find_column_family(ks_name, table_name);
+            co_return make_foreign(make_lw_shared(co_await cf.take_sstable_set_snapshot()));
+        });
+        BOOST_REQUIRE(std::ranges::any_of(held, [] (const held_sstables& ssts) { return !ssts->empty(); }));
+
+        co_await e.execute_cql(format("DROP TABLE {}.{}", ks_name, table_name));
+        BOOST_REQUIRE(co_await file_exists(cf_dir));
+
+        co_await e.execute_cql(format("CREATE TABLE {}.{} (p int PRIMARY KEY) WITH ID = {}", ks_name, table_name, id));
+        BOOST_REQUIRE(co_await file_exists(cf_dir));
+
+        co_await parallel_for_each(held, [] (held_sstables& ssts) {
+            return smp::submit_to(ssts.get_owner_shard(), [&ssts] {
+                ssts->clear();
+            });
+        });
+        // The new table took the storage over, so the last reference of the
+        // dropped table doesn't remove the directory.
+        BOOST_REQUIRE(co_await file_exists(cf_dir));
+
+        // The new table can write sstables to its directory.
+        co_await e.execute_cql(format("INSERT INTO {}.{} (p) VALUES (1)", ks_name, table_name));
+        co_await replica::database::flush_table_on_all_shards(e.db(), ks_name, table_name);
+        auto sstables = co_await e.db().map_reduce0([&] (replica::database& db) {
+            return db.find_column_family(ks_name, table_name).sstables_count();
+        }, size_t(0), std::plus<size_t>());
+        BOOST_REQUIRE(sstables > 0);
+        BOOST_REQUIRE(co_await file_exists(cf_dir));
+    }, false, cfg);
+}
+
 SEASTAR_TEST_CASE(mutation_dump_generated_schema_deterministic_id_version) {
     simple_schema s;
     auto os1 = replica::mutation_dump::generate_output_schema_from_underlying_schema(s.schema());
@@ -1921,6 +1972,76 @@ SEASTAR_TEST_CASE(mutation_dump_generated_schema_deterministic_id_version) {
     BOOST_REQUIRE_EQUAL(os1->version(), os2->version());
 
     return make_ready_future<>();
+}
+
+// Checks that creating a table with the ID of a dropped table waits for a
+// removal of the storage of the dropped table that already found the storage
+// unused. Otherwise the removal could remove the directory of the new table.
+SEASTAR_TEST_CASE(recreate_dropped_table_during_storage_removal) {
+#ifndef SCYLLA_ENABLE_ERROR_INJECTION
+    testlog.debug("Skipping test as it depends on error injection. Please run in mode where it's enabled (debug,dev).\n");
+    co_return;
+#endif
+    sstring ks_name = "ks";
+    sstring table_name = "recreated_during_removal";
+    tmpdir data_dir;
+    auto cfg = make_shared<db::config>();
+    cfg->data_file_directories({data_dir.path().string()}, db::config::config_source::CommandLine);
+    cfg->auto_snapshot.set(false);
+
+    co_await do_with_some_data({table_name}, [&] (cql_test_env& e) -> future<> {
+        auto& cf = e.local_db().find_column_family(ks_name, table_name);
+        auto cf_dir = table_dir(cf).native();
+        auto id = cf.schema()->id();
+        // Held sstables keep the storage in use past the drop, so that their
+        // release removes the directory, in the background.
+        co_await replica::database::flush_table_on_all_shards(e.db(), ks_name, table_name);
+        using held_sstables = foreign_ptr<lw_shared_ptr<utils::chunked_vector<sstables::shared_sstable>>>;
+        auto held = co_await e.db().map([&] (replica::database& db) -> future<held_sstables> {
+            auto& cf = db.find_column_family(ks_name, table_name);
+            co_return make_foreign(make_lw_shared(co_await cf.take_sstable_set_snapshot()));
+        });
+        BOOST_REQUIRE(std::ranges::any_of(held, [] (const held_sstables& ssts) { return !ssts->empty(); }));
+
+        co_await e.execute_cql(format("DROP TABLE {}.{}", ks_name, table_name));
+        BOOST_REQUIRE(co_await file_exists(cf_dir));
+
+        static constexpr auto injection = "storage_manager_remove_table_storage_wait";
+        utils::get_local_injector().enable(injection);
+        co_await parallel_for_each(held, [] (held_sstables& ssts) {
+            return smp::submit_to(ssts.get_owner_shard(), [&ssts] {
+                ssts->clear();
+            });
+        });
+        while (utils::get_local_injector().enter_count(injection) == 0) {
+            co_await seastar::yield();
+        }
+
+        // The injection is entered right before the create waits for the
+        // removal.
+        static constexpr auto acquire_injection = "storage_manager_acquire_table_storage";
+        utils::get_local_injector().enable(acquire_injection);
+        auto created = e.execute_cql(format("CREATE TABLE {}.{} (p int PRIMARY KEY) WITH ID = {}", ks_name, table_name, id));
+        while (utils::get_local_injector().enter_count(acquire_injection) == 0) {
+            co_await seastar::yield();
+        }
+        utils::get_local_injector().disable(acquire_injection);
+        BOOST_REQUIRE(!created.available());
+        BOOST_REQUIRE(!co_await e.db().map_reduce0([id] (replica::database& db) { return db.column_family_exists(id); }, false, std::logical_or<bool>()));
+
+        utils::get_local_injector().receive_message(injection);
+        co_await std::move(created);
+        utils::get_local_injector().disable(injection);
+        BOOST_REQUIRE(co_await file_exists(cf_dir));
+
+        co_await e.execute_cql(format("INSERT INTO {}.{} (p) VALUES (1)", ks_name, table_name));
+        co_await replica::database::flush_table_on_all_shards(e.db(), ks_name, table_name);
+        auto sstables = co_await e.db().map_reduce0([&] (replica::database& db) {
+            return db.find_column_family(ks_name, table_name).sstables_count();
+        }, size_t(0), std::plus<size_t>());
+        BOOST_REQUIRE(sstables > 0);
+        BOOST_REQUIRE(co_await file_exists(cf_dir));
+    }, false, cfg);
 }
 
 SEASTAR_TEST_CASE(enable_drained_compaction_manager) {

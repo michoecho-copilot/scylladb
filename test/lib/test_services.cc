@@ -443,7 +443,8 @@ test_env::make_sstable(schema_ptr schema, sstring dir, sstables::generation_type
             sid_opt = sstable_id(generation.as_uuid());
         },
     }, storage.value);
-    return _impl->mgr.make_sstable(std::move(schema), storage, generation, sid_opt, state, v, f, now, default_io_error_handler_gen(), buffer_size);
+    auto table_storage = _impl->mgr.attach_table_storage(*schema, std::move(storage));
+    return _impl->mgr.make_sstable(std::move(schema), std::move(table_storage), generation, sid_opt, state, v, f, now, default_io_error_handler_gen(), buffer_size);
 }
 
 shared_sstable

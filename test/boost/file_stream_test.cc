@@ -619,7 +619,7 @@ static future<> test_stream_sink_write(sstables::test_env_config cfg) {
             [] (data_dictionary::storage_options::object_storage& o) { o.location = std::nullopt; },
         }, s_opts.value);
 
-        auto sink = create_stream_sink(s, mgr, s_opts, sstable_state::normal, desc, {});
+        auto sink = create_stream_sink(s, mgr, mgr.attach_table_storage(*s, s_opts), sstable_state::normal, desc, {});
 
         // output() would succeed before the fix (wrapping the read-only file into a stream),
         // but the write below would throw std::logic_error("unsupported operation on s3 readable file").
@@ -681,7 +681,7 @@ SEASTAR_THREAD_TEST_CASE(test_stream_sink_stamps_scrub_time_on_completion) {
             auto descriptor = snapshot.sst->get_descriptor(source->type());
             descriptor.generation = gen;
 
-            auto sink = create_stream_sink(schema, table.get_sstables_manager(), table.get_storage_options(),
+            auto sink = create_stream_sink(schema, table.get_sstables_manager(), table.get_table_storage(),
                     sstable_state::normal, descriptor,
                     sstable_stream_sink_cfg{.last_component = i + 1 == sources.size(), .update_scrub_time = true});
 
@@ -707,7 +707,7 @@ SEASTAR_THREAD_TEST_CASE(test_stream_sink_stamps_scrub_time_on_completion) {
         BOOST_REQUIRE(received);
 
         // Check what was persisted rather than what the sink left in memory.
-        auto reopened = table.get_sstables_manager().make_sstable(schema, table.get_storage_options(),
+        auto reopened = table.get_sstables_manager().make_sstable(schema, table.get_table_storage(),
                 received->generation(), *received->sstable_identifier(), sstable_state::normal,
                 received->get_version(), received->get_format());
         reopened->load_metadata().get();

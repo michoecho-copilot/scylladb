@@ -4373,7 +4373,7 @@ mutation_source sstable::as_mutation_source() {
 }
 
 sstable::sstable(schema_ptr schema,
-        const data_dictionary::storage_options& storage,
+        table_storage_ptr storage,
         generation_type generation,
         optimized_optional<sstable_id> sstable_identifier,
         sstable_state state,
@@ -4389,7 +4389,8 @@ sstable::sstable(schema_ptr schema,
     , _schema(std::move(schema))
     , _generation(generation)
     , _state(state)
-    , _storage(make_storage(manager, _schema, storage, _state))
+    , _storage(make_storage(manager, _schema, *storage->options(), _state))
+    , _table_storage(std::move(storage))
     , _version(v)
     , _format(f)
     , _index_cache(std::make_unique<partition_index_cache>(
@@ -4875,8 +4876,8 @@ public:
     }
 };
 
-std::unique_ptr<sstable_stream_sink> create_stream_sink(schema_ptr schema, sstables_manager& sstm, const data_dictionary::storage_options& s_opts, sstable_state state, const entry_descriptor& desc, sstable_stream_sink_cfg cfg) {
-    auto sst = sstm.make_sstable(schema, s_opts, desc.generation, desc.sid, state, desc.version, desc.format);
+std::unique_ptr<sstable_stream_sink> create_stream_sink(schema_ptr schema, sstables_manager& sstm, table_storage_ptr storage, sstable_state state, const entry_descriptor& desc, sstable_stream_sink_cfg cfg) {
+    auto sst = sstm.make_sstable(schema, std::move(storage), desc.generation, desc.sid, state, desc.version, desc.format);
 
     auto type = desc.component;
     // Don't write actual TOC. Write temp, if successful, storage::seal will rename this to actual

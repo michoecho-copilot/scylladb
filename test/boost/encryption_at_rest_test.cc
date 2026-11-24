@@ -730,7 +730,7 @@ static future<> test_statistics_rewrite_encryption_mismatch(const tmpdir& tmp,
                 // Statistics.db, which must be decoded consistently with the
                 // sstable's scylla_metadata. Before the fix this throws.
                 auto reloaded = cf.get_sstables_manager().make_sstable(
-                        cf.schema(), cf.get_storage_options(), new_sst->generation(),
+                        cf.schema(), cf.get_table_storage(), new_sst->generation(),
                         new_sst->state(), new_sst->get_version(), new_sst->get_format());
                 co_await reloaded->load(cf.schema()->get_sharder());
                 BOOST_REQUIRE_EQUAL(reloaded->get_stats_metadata().repaired_at,
