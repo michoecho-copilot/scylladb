@@ -69,6 +69,7 @@
 #include "absl-flat_hash_map.hh"
 #include "utils/cross-shard-barrier.hh"
 #include "sstables/generation_type.hh"
+#include "sstables/table_storage.hh"
 #include "db/rate_limiter.hh"
 #include "db/operation_type.hh"
 #include "locator/tablet_types.hh"
@@ -518,6 +519,9 @@ private:
     config _config;
     locator::effective_replication_map_ptr _erm;
     lw_shared_ptr<const storage_options> _storage_opts;
+    // Keeps the storage of the table in place, from the construction of the
+    // table until stop(). See sstables::table_storage.
+    sstables::table_storage_ptr _storage;
     memtable_table_shared_data _memtable_shared_data;
     mutable table_stats _stats;
     mutable db::view::stats _view_stats;
@@ -912,8 +916,6 @@ private:
 public:
     const storage_options& get_storage_options() const noexcept { return *_storage_opts; }
     lw_shared_ptr<const storage_options> get_storage_options_ptr() const noexcept { return _storage_opts; }
-    future<> init_storage();
-    future<> destroy_storage();
 
     seastar::named_gate& async_gate() { return _async_gate; }
 
@@ -1086,7 +1088,7 @@ public:
 
     logalloc::occupancy_stats occupancy() const;
 public:
-    table(schema_ptr schema, config cfg, lw_shared_ptr<const storage_options> sopts, compaction::compaction_manager& cm,
+    table(schema_ptr schema, config cfg, sstables::table_storage_ptr storage, compaction::compaction_manager& cm,
             logstor::logstor* logstor, sstables::sstables_manager& sm, cell_locker_stats& cl_stats, cache_tracker& row_cache_tracker,
             locator::effective_replication_map_ptr erm, const keyspace* ks = nullptr);
 
@@ -1852,6 +1854,7 @@ private:
     bool _shutdown = false;
     bool _enable_autocompaction_toggle = false;
     bool _vnodes_cleanup_allowed = false;
+
     querier_cache _querier_cache;
 
     std::unique_ptr<db::large_data_handler> _large_data_handler;
@@ -2042,14 +2045,18 @@ public:
     //
     // Note: 'system table' does not necessarily mean it sits in `system` keyspace, it could also be `system_schema`;
     // in general we mean local tables created by the system (not the user).
+    // With `with_storage` unset, the table gets no directory. Virtual tables,
+    // which have no sstables, use that.
     future<> create_local_system_table(
-            schema_ptr table, bool write_in_user_memory, locator::effective_replication_map_factory&);
+            schema_ptr table, bool write_in_user_memory, locator::effective_replication_map_factory&, bool with_storage = true);
 
     void init_schema_commitlog();
 
     using is_new_cf = bool_class<struct is_new_cf_tag>;
-    void add_column_family(keyspace& ks, schema_ptr schema, column_family::config cfg, is_new_cf is_new, locator::token_metadata_ptr not_commited_new_metadata = nullptr, std::optional<service::storage_mode> storage_mode = std::nullopt);
-    future<> make_column_family_directory(schema_ptr schema);
+    // `storage` is the reference to the storage of the table on this shard,
+    // see open_table_storage(). The table has its directory from the start,
+    // so it can flush as soon as it accepts writes.
+    void add_column_family(keyspace& ks, schema_ptr schema, column_family::config cfg, sstables::table_storage_ptr storage, is_new_cf is_new, locator::token_metadata_ptr not_commited_new_metadata = nullptr, std::optional<service::storage_mode> storage_mode = std::nullopt);
     future<> add_column_family_and_make_directory(schema_ptr schema, is_new_cf is_new, std::optional<service::storage_mode> storage_mode = std::nullopt);
 
 
@@ -2301,6 +2308,13 @@ public:
     static future<> legacy_drop_table_on_all_shards(sharded<database>& sharded_db, sharded<db::system_keyspace>& sys_ks,
             sstring ks_name, sstring cf_name,
             bool with_snapshot = true);
+    // Waits until the storage of a table has no user on any shard, and the
+    // removal that drop table asked for, if any, is done. For tests.
+    future<> await_table_storage_unused(table_id id);
+    // Opens the storage of a table that is about to be added on this shard,
+    // see sstables::sstables_manager::open_table_storage(). The table object
+    // takes the returned reference, see add_column_family().
+    future<sstables::table_storage_ptr> open_table_storage(const schema& s, const data_dictionary::storage_options& keyspace_so);
 
     const dirty_memory_manager_logalloc::region_group& dirty_memory_region_group() const {
         return _dirty_memory_manager.region_group();

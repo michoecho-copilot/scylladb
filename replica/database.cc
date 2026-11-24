@@ -491,7 +491,7 @@ database::database(const db::config& cfg, database_config dbcfg, service::migrat
     , _corrupt_data_handler(std::make_unique<db::system_table_corrupt_data_handler>(db::system_table_corrupt_data_handler::config{.entry_ttl = std::chrono::days(10)}, db::corrupt_data_handler::register_metrics::yes))
     , _nop_corrupt_data_handler(std::make_unique<db::nop_corrupt_data_handler>(db::corrupt_data_handler::register_metrics::no))
     , _user_sstables_manager(std::make_unique<sstables::sstables_manager>("user", *_large_data_handler, *_corrupt_data_handler, configure_sstables_manager(_cfg, dbcfg), feat, _row_cache_tracker, sst_dir_sem, [&stm]{ return stm.get()->get_my_id(); }, scf, abort, _cfg.extensions().sstable_file_io_extensions(), dbcfg.maintenance_scheduling_group, &sstm))
-    , _system_sstables_manager(std::make_unique<sstables::sstables_manager>("system", *_nop_large_data_handler, *_nop_corrupt_data_handler, configure_sstables_manager(_cfg, dbcfg), feat, _row_cache_tracker, sst_dir_sem, [&stm]{ return stm.get()->get_my_id(); }, scf, abort, _cfg.extensions().sstable_file_io_extensions(), dbcfg.maintenance_scheduling_group))
+    , _system_sstables_manager(std::make_unique<sstables::sstables_manager>("system", *_nop_large_data_handler, *_nop_corrupt_data_handler, configure_sstables_manager(_cfg, dbcfg), feat, _row_cache_tracker, sst_dir_sem, [&stm]{ return stm.get()->get_my_id(); }, scf, abort, _cfg.extensions().sstable_file_io_extensions(), dbcfg.maintenance_scheduling_group, &sstm))
     , _result_memory_limiter(dbcfg.available_memory / 10)
     , _data_listeners(std::make_unique<db::data_listeners>())
     , _mnotifier(mn)
@@ -1190,7 +1190,7 @@ std::optional<table_id> database::get_base_table_for_tablet_colocation(const sch
 }
 
 future<> database::create_local_system_table(
-        schema_ptr table, bool write_in_user_memory, locator::effective_replication_map_factory& erm_factory) {
+        schema_ptr table, bool write_in_user_memory, locator::effective_replication_map_factory& erm_factory, bool with_storage) {
     auto ks_name = table->ks_name();
     if (!has_keyspace(ks_name)) {
         bool durable = _cfg.data_file_directories().size() > 0;
@@ -1213,10 +1213,14 @@ future<> database::create_local_system_table(
         cfg.memtable_scheduling_group = default_scheduling_group();
         cfg.memtable_to_cache_scheduling_group = default_scheduling_group();
     }
+    auto& sst_manager = get_sstables_manager(*table);
+    auto storage = with_storage
+            ? co_await open_table_storage(*table, ks.metadata()->get_storage_options())
+            : sst_manager.attach_table_storage(*table, sst_manager.make_table_storage_options(*table, ks.metadata()->get_storage_options()));
     auto lock = co_await get_tables_metadata().hold_write_lock();
     std::exception_ptr ex;
     try {
-        add_column_family(ks, table, std::move(cfg), replica::database::is_new_cf::no);
+        add_column_family(ks, table, std::move(cfg), std::move(storage), replica::database::is_new_cf::no);
     } catch (...) {
         ex = std::current_exception();
     }
@@ -1236,7 +1240,7 @@ db::commitlog* database::commitlog_for(const schema_ptr& schema) {
         : _commitlog.get();
 }
 
-void database::add_column_family(keyspace& ks, schema_ptr schema, column_family::config cfg, is_new_cf is_new, locator::token_metadata_ptr not_commited_new_metadata, std::optional<service::storage_mode> storage_mode) {
+void database::add_column_family(keyspace& ks, schema_ptr schema, column_family::config cfg, sstables::table_storage_ptr storage, is_new_cf is_new, locator::token_metadata_ptr not_commited_new_metadata, std::optional<service::storage_mode> storage_mode) {
     schema = local_schema_registry().learn(schema);
     auto&& rs = ks.get_replication_strategy();
     locator::effective_replication_map_ptr erm;
@@ -1271,11 +1275,7 @@ void database::add_column_family(keyspace& ks, schema_ptr schema, column_family:
 
     // avoid self-reporting
     auto& sst_manager = get_sstables_manager(*schema);
-    // The table has the path of its directory from the start, so that it can
-    // flush as soon as it accepts writes. The caller creates the directory,
-    // see schema_applier::update() and make_column_family_directory().
-    auto storage_opts = sst_manager.make_table_storage_options(*schema, ks.metadata()->get_storage_options());
-    auto cf = make_lw_shared<column_family>(schema, std::move(cfg), std::move(storage_opts), _compaction_manager,
+    auto cf = make_lw_shared<column_family>(schema, std::move(cfg), std::move(storage), _compaction_manager,
             schema->logstor_enabled() ? _logstor.get() : nullptr, sst_manager, *_cl_stats, _row_cache_tracker, erm, &ks);
     cf->set_durable_writes(ks.metadata()->durable_writes());
 
@@ -1298,18 +1298,17 @@ void database::add_column_family(keyspace& ks, schema_ptr schema, column_family:
     schema->registry_entry()->mark_synced();
 }
 
-future<> database::make_column_family_directory(schema_ptr schema) {
-    auto& cf = find_column_family(schema);
-    cf.get_index_manager().reload();
-    co_await cf.init_storage();
+future<sstables::table_storage_ptr> database::open_table_storage(const schema& s, const data_dictionary::storage_options& keyspace_so) {
+    return get_sstables_manager(s).open_table_storage(s, keyspace_so);
 }
 
 future<> database::add_column_family_and_make_directory(schema_ptr schema, is_new_cf is_new, std::optional<service::storage_mode> storage_mode) {
+    auto storage = co_await open_table_storage(*schema, find_keyspace(schema->ks_name()).metadata()->get_storage_options());
     auto lock = co_await get_tables_metadata().hold_write_lock();
     auto& ks = find_keyspace(schema->ks_name());
     std::exception_ptr ex;
     try {
-        add_column_family(ks, schema, ks.make_column_family_config(*schema, *this), is_new, nullptr, storage_mode);
+        add_column_family(ks, schema, ks.make_column_family_config(*schema, *this), std::move(storage), is_new, nullptr, storage_mode);
     } catch (...) {
         ex = std::current_exception();
     }
@@ -1321,7 +1320,7 @@ future<> database::add_column_family_and_make_directory(schema_ptr schema, is_ne
     if (ex) {
         co_await coroutine::return_exception_ptr(std::move(ex));
     }
-    co_await make_column_family_directory(schema);
+    find_column_family(schema).get_index_manager().reload();
 }
 
 bool database::update_column_family(schema_ptr new_schema) {
@@ -1448,6 +1447,10 @@ void database::drop_table(sharded<database>& sharded_db,
 
 future<> database::cleanup_drop_table_on_all_shards(sharded<database>& sharded_db, sharded<db::system_keyspace>& sys_ks,
         bool with_snapshot, global_table_ptr& table_shards) {
+    auto id = table_shards->schema()->id();
+    // The table is removed from the metadata, but still running. Lets a test
+    // act on it in this state.
+    co_await utils::get_local_injector().inject("cleanup_drop_table_wait", utils::wait_for_message(60s));
     co_await sharded_db.invoke_on_all([&] (database& db) -> future<> {
         auto& cf = *table_shards;
         auto uuid = cf.schema()->id();
@@ -1479,8 +1482,23 @@ future<> database::cleanup_drop_table_on_all_shards(sharded<database>& sharded_d
         return table_shards->stop();
     });
     f.get(); // re-throw exception from truncate() if any
-    co_await sys_ks.local().remove_truncation_records(table_shards->schema()->id());
-    co_await table_shards->destroy_storage();
+    utils::get_local_injector().inject("cleanup_drop_table_fail", [] {
+        throw std::runtime_error("cleanup_drop_table_fail injection");
+    });
+    co_await sys_ks.local().remove_truncation_records(id);
+    // If the cleanup failed above, the storage of the table stays behind, as
+    // it did before the removal was deferred.
+    //
+    // Sstables of the table can be referenced outside of it, and the directory
+    // is removed only once they are destroyed. References can be held for an
+    // unbounded time. So the sstables manager removes the storage only once
+    // it has no user on any shard: here if it has none, otherwise when the
+    // last user releases it.
+    co_await table_shards->get_sstables_manager().drop_table_storage(id, table_shards->get_storage_options());
+}
+
+future<> database::await_table_storage_unused(table_id id) {
+    return get_user_sstables_manager().await_table_storage_unused(id);
 }
 
 future<> database::legacy_drop_table_on_all_shards(sharded<database>& sharded_db, sharded<db::system_keyspace>& sys_ks,
@@ -1751,14 +1769,6 @@ keyspace::make_column_family_config(const schema& s, const database& db) const {
     };
 
     return cfg;
-}
-
-future<> table::init_storage() {
-    return _sstables_manager.init_table_storage(*_storage_opts);
-}
-
-future<> table::destroy_storage() {
-    return _sstables_manager.destroy_table_storage(*_storage_opts);
 }
 
 column_family& database::find_column_family(const schema_ptr& schema) {

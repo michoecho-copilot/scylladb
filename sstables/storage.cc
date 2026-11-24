@@ -1426,24 +1426,6 @@ lw_shared_ptr<const data_dictionary::storage_options> make_table_storage_options
     return std::visit([&mgr, &s] (const auto& so) { return make_table_storage_options(mgr, s, so); }, so.value);
 }
 
-future<> init_table_storage(const sstables_manager& mgr, const data_dictionary::storage_options& so) {
-    co_await std::visit(overloaded_functor {
-        [&mgr] (const data_dictionary::storage_options::local& so) -> future<> {
-            const auto& data_dirs = mgr.get_config().data_file_directories;
-            if (data_dirs.empty()) {
-                co_return;
-            }
-            if (so.dir.empty()) {
-                on_internal_error(sstlog, "Non-table local storage options");
-            }
-            co_await init_table_directories(get_local_directories(data_dirs, so));
-        },
-        [] (const data_dictionary::storage_options::object_storage&) -> future<> {
-            co_return;
-        }
-    }, so.value);
-}
-
 future<> init_table_directories(const std::vector<std::filesystem::path>& dirs) {
     co_await coroutine::parallel_for_each(dirs, [] (const fs::path& path) -> future<> {
         auto dir = path.native();
@@ -1461,20 +1443,6 @@ future<> init_keyspace_storage(const sstables_manager& mgr, const data_dictionar
                 auto dir = format("{}/{}", data_dirs[0], ks_name);
                 co_await io_check([&dir] { return touch_directory(dir); });
             }
-        },
-        [] (const data_dictionary::storage_options::object_storage&) -> future<> {
-            co_return;
-        }
-    }, so.value);
-}
-
-future<> destroy_table_storage(const data_dictionary::storage_options& so) {
-    co_await std::visit(overloaded_functor {
-        [] (const data_dictionary::storage_options::local& so) -> future<> {
-            if (so.dir.empty()) {
-                on_internal_error(sstlog, "Non-table local storage options");
-            }
-            co_await sstables::remove_table_directory_if_has_no_snapshots(so.dir);
         },
         [] (const data_dictionary::storage_options::object_storage&) -> future<> {
             co_return;

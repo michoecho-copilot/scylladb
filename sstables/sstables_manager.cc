@@ -635,16 +635,8 @@ lw_shared_ptr<const data_dictionary::storage_options> sstables_manager::make_tab
     return sstables::make_table_storage_options(*this, s, keyspace_so);
 }
 
-future<> sstables_manager::init_table_storage(const data_dictionary::storage_options& so) {
-    return sstables::init_table_storage(*this, so);
-}
-
 future<> sstables_manager::init_keyspace_storage(const data_dictionary::storage_options& so, sstring dir) {
     return sstables::init_keyspace_storage(*this, so, dir);
-}
-
-future<> sstables_manager::destroy_table_storage(const data_dictionary::storage_options& so) {
-    return sstables::destroy_table_storage(so);
 }
 
 table_storage::table_storage(sstables_manager& manager, table_id id, lw_shared_ptr<const data_dictionary::storage_options> options, bool counted)

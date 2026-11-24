@@ -983,7 +983,7 @@ future<> schema_applier::update() {
     co_await update_tablets();
     co_await merge_functions();
     co_await merge_aggregates();
-    co_await create_table_storage();
+    co_await open_table_storage();
 }
 
 const data_dictionary::storage_options& schema_applier::keyspace_storage_options(std::string_view ks_name) const {
@@ -1002,19 +1002,20 @@ const data_dictionary::storage_options& schema_applier::keyspace_storage_options
     return _proxy.local().get_db().local().find_keyspace(ks_name).metadata()->get_storage_options();
 }
 
-future<> schema_applier::create_table_storage() {
-    auto& db = _proxy.local().get_db().local();
-    const auto& diff = _affected_tables_and_views.tables_and_views.local();
-    auto create = [&] (const std::vector<schema_ptr>& created) {
-        return max_concurrent_for_each(created, max_concurrent, [&] (const schema_ptr& s) -> future<> {
-            auto& mgr = db.get_sstables_manager(*s);
-            auto so = mgr.make_table_storage_options(*s, keyspace_storage_options(s->ks_name()));
-            co_await mgr.init_table_storage(*so);
-        });
-    };
-    co_await create(diff.cdc.created);
-    co_await create(diff.tables.created);
-    co_await create(diff.views.created);
+future<> schema_applier::open_table_storage() {
+    // If the storage of a dropped table with the same ID as a created table
+    // is being removed, the open waits for that removal only. If the storage
+    // is still in use, the created table takes it over. See
+    // sstables::sstables_manager::open_table_storage().
+    co_await _proxy.local().get_db().invoke_on_all([this] (replica::database& db) -> future<> {
+        auto& local = _affected_tables_and_views.tables_and_views.local();
+        for (const auto* created : {&local.cdc.created, &local.tables.created, &local.views.created}) {
+            co_await max_concurrent_for_each(*created, max_concurrent, [&] (const schema_ptr& s) -> future<> {
+                auto storage = co_await db.open_table_storage(*s, keyspace_storage_options(s->ks_name()));
+                local.created_storage.insert_or_assign(s->id(), std::move(storage));
+            });
+        }
+    });
 }
 
 void schema_applier::commit_tables_and_views() {
@@ -1038,19 +1039,21 @@ void schema_applier::commit_tables_and_views() {
         replica::database::drop_table(sharded_db, s->ks_name(), s->cf_name(), true, diff.table_shards[s->id()]);
     }
 
-    for (auto& schema : cdc.created) {
+    auto add_created = [&] (const schema_ptr& schema) {
         auto& ks = db.find_keyspace(schema->ks_name());
-        db.add_column_family(ks, schema, ks.make_column_family_config(*schema, db), replica::database::is_new_cf::yes, _pending_token_metadata.local());
+        auto storage = std::move(diff.tables_and_views.local().created_storage.at(schema->id()));
+        db.add_column_family(ks, schema, ks.make_column_family_config(*schema, db), std::move(storage), replica::database::is_new_cf::yes, _pending_token_metadata.local());
+    };
+    for (auto& schema : cdc.created) {
+        add_created(schema);
     }
 
     for (auto& schema : tables.created) {
-        auto& ks = db.find_keyspace(schema->ks_name());
-        db.add_column_family(ks, schema, ks.make_column_family_config(*schema, db), replica::database::is_new_cf::yes, _pending_token_metadata.local());
+        add_created(schema);
     }
 
     for (auto& schema : views.created) {
-        auto& ks = db.find_keyspace(schema->ks_name());
-        db.add_column_family(ks, schema, ks.make_column_family_config(*schema, db), replica::database::is_new_cf::yes, _pending_token_metadata.local());
+        add_created(schema);
     }
 
     diff.tables_and_views.local().columns_changed.reserve(tables.altered.size() + cdc.altered.size() + views.altered.size());

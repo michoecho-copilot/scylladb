@@ -373,9 +373,6 @@ public:
     future<utils::chunked_vector<sstable_snapshot_metadata>> take_snapshot(std::vector<shared_sstable> ssts, sstring jsondir);
     // See sstables::make_table_storage_options().
     lw_shared_ptr<const data_dictionary::storage_options> make_table_storage_options(const schema& s, const data_dictionary::storage_options& keyspace_so) const;
-    // See sstables::init_table_storage().
-    future<> init_table_storage(const data_dictionary::storage_options& so);
-    future<> destroy_table_storage(const data_dictionary::storage_options& so);
     future<> init_keyspace_storage(const data_dictionary::storage_options& so, sstring dir);
 
     void validate_new_keyspace_storage_options(const data_dictionary::storage_options&);

@@ -174,11 +174,6 @@ future<object_storage_reference_names> list_object_storage_references(object_sto
 // Returns the storage options of a table, given the storage options of its
 // keyspace. For local storage, they name the directory of the table.
 lw_shared_ptr<const data_dictionary::storage_options> make_table_storage_options(const sstables_manager&, const schema&, const data_dictionary::storage_options& keyspace_so);
-// Creates the storage of a table, given the storage options of the table, see
-// make_table_storage_options(). For local storage, creates the directory of
-// the table in every data directory.
-future<> init_table_storage(const sstables_manager&, const data_dictionary::storage_options& so);
-future<> destroy_table_storage(const data_dictionary::storage_options& so);
 // Creates the directory of a table in every data directory, see
 // get_local_directories().
 future<> init_table_directories(const std::vector<std::filesystem::path>& dirs);

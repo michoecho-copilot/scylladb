@@ -13,6 +13,7 @@
 #include <seastar/core/smp.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/coroutine.hh>
+#include <seastar/coroutine/as_future.hh>
 #include <seastar/core/bitops.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/util/file.hh>
@@ -44,6 +45,7 @@
 #include "schema/schema_builder.hh"
 #include "service/migration_manager.hh"
 #include "sstables/sstables.hh"
+#include "sstables/sstables_manager.hh"
 #include "sstables/generation_type.hh"
 #include "sstables/sstable_version.hh"
 #include "db/config.hh"
@@ -1073,6 +1075,7 @@ SEASTAR_TEST_CASE(clear_multiple_snapshots) {
     co_await do_with_some_data_in_thread({table_name}, [&] (cql_test_env& e) {
         auto& t = e.local_db().find_column_family(ks_name, table_name);
         auto tdir = table_dir(t);
+        auto id = t.schema()->id();
         auto snapshots_dir = tdir / sstables::snapshots_dir;
 
         for (auto i = 0; i < num_snapshots; i++) {
@@ -1119,6 +1122,10 @@ SEASTAR_TEST_CASE(clear_multiple_snapshots) {
         // clear all tags
         testlog.debug("Clearing all snapshots in {}.{} after it had been dropped", ks_name, table_name);
         e.local_db().clear_snapshot("", {ks_name}, table_name).get();
+        // clear_snapshot() leaves the table directory behind while sstables of
+        // the dropped table are not destroyed yet. The removal of the storage
+        // of the table removes it then.
+        e.local_db().await_table_storage_unused(id).get();
 
         SCYLLA_ASSERT(!fs::exists(tdir));
 
@@ -1840,12 +1847,15 @@ static future<> test_drop_table_with_auto_snapshot(bool auto_snapshot) {
     db_cfg_ptr->auto_snapshot(auto_snapshot);
 
     co_await do_with_some_data({table_name}, [&] (cql_test_env& e) -> future<> {
-        auto cf_dir = table_dir(e.local_db().find_column_family(ks_name, table_name)).native();
+        auto& cf = e.local_db().find_column_family(ks_name, table_name);
+        auto cf_dir = table_dir(cf).native();
+        auto id = cf.schema()->id();
 
         // Pass `with_snapshot=true` to drop_table_on_all
         // to allow auto_snapshot (based on the configuration above).
         // The table directory should therefore exist after the table is dropped if auto_snapshot is disabled in the configuration.
         co_await replica::database::legacy_drop_table_on_all_shards(e.db(), e.get_system_keyspace(), ks_name, table_name, true);
+        co_await e.local_db().await_table_storage_unused(id);
         auto cf_dir_exists = co_await file_exists(cf_dir);
         BOOST_REQUIRE_EQUAL(cf_dir_exists, auto_snapshot);
         co_return;
@@ -1865,12 +1875,15 @@ SEASTAR_TEST_CASE(drop_table_with_no_snapshot) {
     sstring table_name = "table_with_no_snapshot";
 
     co_await do_with_some_data({table_name}, [&] (cql_test_env& e) -> future<> {
-        auto cf_dir = table_dir(e.local_db().find_column_family(ks_name, table_name)).native();
+        auto& cf = e.local_db().find_column_family(ks_name, table_name);
+        auto cf_dir = table_dir(cf).native();
+        auto id = cf.schema()->id();
 
         // Pass `with_snapshot=false` to drop_table_on_all
         // to disallow auto_snapshot.
         // The table directory should therefore not exist after the table is dropped.
         co_await replica::database::legacy_drop_table_on_all_shards(e.db(), e.get_system_keyspace(), ks_name, table_name, false);
+        co_await e.local_db().await_table_storage_unused(id);
         auto cf_dir_exists = co_await file_exists(cf_dir);
         BOOST_REQUIRE_EQUAL(cf_dir_exists, false);
         co_return;
@@ -1884,12 +1897,15 @@ SEASTAR_TEST_CASE(drop_table_with_explicit_snapshot) {
     co_await do_with_some_data({table_name}, [&] (cql_test_env& e) -> future<> {
         auto snapshot_tag = format("test-{}", db_clock::now().time_since_epoch().count());
         co_await take_snapshot(e, ks_name, table_name, snapshot_tag);
-        auto cf_dir = table_dir(e.local_db().find_column_family(ks_name, table_name)).native();
+        auto& cf = e.local_db().find_column_family(ks_name, table_name);
+        auto cf_dir = table_dir(cf).native();
+        auto id = cf.schema()->id();
 
         // With explicit snapshot and with_snapshot=false
         // dir should still be kept, regardless of the
         // with_snapshot parameter and auto_snapshot config.
         co_await replica::database::legacy_drop_table_on_all_shards(e.db(), e.get_system_keyspace(), ks_name, table_name, false);
+        co_await e.local_db().await_table_storage_unused(id);
         auto cf_dir_exists = co_await file_exists(cf_dir);
         BOOST_REQUIRE_EQUAL(cf_dir_exists, true);
         co_return;

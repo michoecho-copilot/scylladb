@@ -2375,6 +2375,10 @@ table::stop() noexcept {
         co_await _logstor_index->drain_cache();
     }
     _cache.refresh_snapshot();
+    // The writers of the table are drained, so it no longer uses its storage.
+    // If stop() fails before this, the destructor of the table releases the
+    // reference.
+    _storage = nullptr;
 }
 static seastar::metrics::label_instance node_table_metrics("__per_table", "node");
 void table::set_metrics() {
@@ -3653,14 +3657,15 @@ void storage_group::clear_logstor_segments() {
     });
 }
 
-table::table(schema_ptr schema, config config, lw_shared_ptr<const storage_options> sopts, compaction::compaction_manager& compaction_manager,
+table::table(schema_ptr schema, config config, sstables::table_storage_ptr storage, compaction::compaction_manager& compaction_manager,
         logstor::logstor* logstor, sstables::sstables_manager& sst_manager, cell_locker_stats& cl_stats, cache_tracker& row_cache_tracker,
         locator::effective_replication_map_ptr erm, const keyspace* ks)
     : _schema(std::move(schema))
     , _keyspace(ks)
     , _config(std::move(config))
     , _erm(std::move(erm))
-    , _storage_opts(std::move(sopts))
+    , _storage_opts(storage->options())
+    , _storage(std::move(storage))
     , _view_stats(format("{}_{}_view_replica_update", _schema->ks_name(), _schema->cf_name()),
                          keyspace_label(_schema->ks_name()),
                          column_family_label(_schema->cf_name())
