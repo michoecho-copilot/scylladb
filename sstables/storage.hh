@@ -179,6 +179,9 @@ lw_shared_ptr<const data_dictionary::storage_options> make_table_storage_options
 // the table in every data directory.
 future<> init_table_storage(const sstables_manager&, const data_dictionary::storage_options& so);
 future<> destroy_table_storage(const data_dictionary::storage_options& so);
+// Creates the directory of a table in every data directory, see
+// get_local_directories().
+future<> init_table_directories(const std::vector<std::filesystem::path>& dirs);
 future<> init_keyspace_storage(const sstables_manager&, const data_dictionary::storage_options& so, sstring ks_name);
 
 std::vector<std::filesystem::path> get_local_directories(const std::vector<sstring>& data_file_directories, const data_dictionary::storage_options::local& so);

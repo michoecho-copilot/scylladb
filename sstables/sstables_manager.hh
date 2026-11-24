@@ -9,9 +9,13 @@
 
 #pragma once
 
+#include <unordered_map>
+
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/semaphore.hh>
+#include <seastar/core/shared_future.hh>
 #include <seastar/core/metrics.hh>
 
 #include "utils/assert.hh"
@@ -20,6 +24,7 @@
 #include "sstables/sstables.hh"
 #include "sstables/shareable_components.hh"
 #include "sstables/shared_sstable.hh"
+#include "sstables/table_storage.hh"
 #include "sstables/version.hh"
 #include "db/cache_tracker.hh"
 #include "db/object_storage_endpoint_param.hh"
@@ -111,6 +116,34 @@ class storage_manager : public peering_sharded_service<storage_manager> {
 
     object_storage_endpoint& get_endpoint(const sstring& ep);
 
+    // The storage of a table that is referenced on some shard, or is being
+    // created or removed. Only local storage is tracked. Kept on shard 0.
+    struct table_storage_state {
+        // The paths of the directory of the table, one per data directory.
+        // There is usually one data directory. But the data_file_directories
+        // option can list several, and the table then has a directory in each
+        // of them. New sstables are written only to the first.
+        std::vector<std::filesystem::path> dirs;
+        // The counted table_storage references on all shards, and the
+        // operations in progress.
+        size_t users = 0;
+        // Whether the directories exist.
+        bool created = false;
+        // Whether the table was dropped. The last user then removes the
+        // directories.
+        bool dropped = false;
+        // Serializes the creation and the removal of the directories.
+        semaphore lock{1};
+        // Resolved when the storage has no user, and its removal, if any, is
+        // done.
+        shared_promise<> unused;
+    };
+    using table_storage_state_ptr = lw_shared_ptr<table_storage_state>;
+    std::unordered_map<table_id, table_storage_state_ptr> _table_storages;
+
+    table_storage_state_ptr use_table_storage(table_id id);
+    future<> unuse_table_storage(table_id id, table_storage_state_ptr ts) noexcept;
+
 public:
     struct config {
         size_t object_storage_clients_memory = 16 << 20; // 16M by default
@@ -125,6 +158,30 @@ public:
     sstring get_endpoint_type(sstring endpoint);
     future<> stop();
     std::vector<sstring> endpoints(sstring type = "") const noexcept;
+
+    // The functions below track the users of the local storage of each table
+    // across shards, and create and remove its directories. They run on
+    // shard 0. Callers use them through sstables_manager.
+    //
+    // Creating and removing the directories of one table is serialized.
+    // Different tables don't wait for each other.
+
+    // Adds a user of the storage of the table. Creates the directories if
+    // they don't exist. Clears the dropped mark: a table that is created with
+    // the ID of a dropped table takes the directories over.
+    future<> acquire_table_storage(table_id id, std::vector<std::filesystem::path> dirs);
+    // Removes a user. The last user removes the directories, if the table
+    // was dropped.
+    future<> release_table_storage(table_id id) noexcept;
+    // Marks the table as dropped. Removes the directories if the storage has
+    // no user. Otherwise, the last user removes them.
+    future<> drop_table_storage(table_id id, std::vector<std::filesystem::path> dirs);
+    // Removes a directory of the table if the storage has no user. Returns
+    // whether it has none.
+    future<bool> remove_table_directory_if_unused(table_id id, std::filesystem::path dir);
+    // Waits until the storage of the table has no user, and its removal, if
+    // any, is done.
+    future<> await_table_storage_unused(table_id id);
 };
 
 class sstables_manager {
@@ -168,6 +225,10 @@ private:
     // update scylla-gdb.py as well.
     list_type _active;
     list_type _undergoing_close;
+
+    // Holds the releases of counted references, which run in the background
+    // on shard 0. close() waits for them.
+    seastar::named_gate _table_storage_gate{"sstables_manager::table_storage"};
 
     // Total reclaimable memory used by components of sstables in _active list
     size_t _total_reclaimable_memory{0};
@@ -326,6 +387,33 @@ public:
     // To be called by the sstable to signal its unlinking
     void on_unlink(sstable* sst);
 
+    // Opens the storage of a table, given the storage options of its
+    // keyspace, and returns a reference to it. Creates the storage first if
+    // it doesn't exist. See table_storage.
+    //
+    // If the storage of a dropped table with the same ID is being removed,
+    // waits until the removal is done. If it is still referenced, the new
+    // table takes it over, and it is not removed.
+    future<table_storage_ptr> open_table_storage(const schema& s, const data_dictionary::storage_options& keyspace_so);
+    // Returns a reference to storage that the caller creates and removes on
+    // its own. It doesn't keep the storage in place. For tests and tools,
+    // which work without a database, and for tables that never write
+    // sstables.
+    table_storage_ptr attach_table_storage(const schema& s, lw_shared_ptr<const data_dictionary::storage_options> so);
+    // Tells that the table was dropped, so its storage must be removed. The
+    // storage is removed once it has no reference on any shard: before this
+    // returns if it has none, otherwise in the background, by whoever
+    // releases the last reference.
+    future<> drop_table_storage(table_id id, const data_dictionary::storage_options& table_so);
+    // Removes one directory of a dropped table, unless the storage of the
+    // table is referenced on some shard. Returns whether it has no reference.
+    // If it has, and the table was dropped with drop_table_storage(), the
+    // last reference removes the directory.
+    future<bool> remove_table_directory_if_unused(table_id id, std::filesystem::path table_dir);
+    // Waits until the storage of the table has no reference on any shard, and
+    // the removal that the last reference started, if any, is done. For tests.
+    future<> await_table_storage_unused(table_id id);
+
     std::vector<std::filesystem::path> get_local_directories(const data_dictionary::storage_options::local& so) const;
 
     sstable_compressor_factory& get_compressor_factory() const { return _compressor_factory; }
@@ -363,6 +451,9 @@ private:
     // Unlink the sstable from _reclaimed, if it is linked. Erasing by key would
     // remove an arbitrary sstable with the same total_memory_reclaimed().
     void erase_from_reclaimed(sstable* sst) noexcept;
+    friend class table_storage;
+    // Called by the destructor of a counted table_storage.
+    void release_table_storage(table_id id) noexcept;
 private:
     db::large_data_handler& get_large_data_handler() const {
         return _large_data_handler;

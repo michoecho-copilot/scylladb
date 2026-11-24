@@ -20,6 +20,7 @@
 #include "sstables/partition_index_cache.hh"
 #include "sstables/sstables.hh"
 #include "object_storage_client.hh"
+#include "data_dictionary/data_dictionary.hh"
 #include "db/config.hh"
 #include "db/object_storage_endpoint_param.hh"
 #include "gms/feature.hh"
@@ -162,6 +163,122 @@ future<> storage_manager::stop() {
     }
 }
 
+
+auto storage_manager::use_table_storage(table_id id) -> table_storage_state_ptr {
+    if (this_shard_id() != 0) {
+        on_internal_error(smlogger, "The storage of tables is tracked on shard 0");
+    }
+    auto& ts = _table_storages[id];
+    if (!ts) {
+        ts = make_lw_shared<table_storage_state>();
+    }
+    ++ts->users;
+    return ts;
+}
+
+future<> storage_manager::unuse_table_storage(table_id id, table_storage_state_ptr ts) noexcept {
+    if (--ts->users != 0) {
+        co_return;
+    }
+    auto units = co_await get_units(ts->lock, 1);
+    if (ts->users != 0) {
+        // A new table took the storage over while this waited for the lock.
+        co_return;
+    }
+    if (ts->dropped) {
+        co_await utils::get_local_injector().inject("storage_manager_remove_table_storage_wait", utils::wait_for_message(std::chrono::seconds(60)));
+        for (const auto& dir : ts->dirs) {
+            try {
+                smlogger.info("Removing the directory {} of dropped table {}", dir, id);
+                co_await remove_table_directory_if_has_no_snapshots(dir);
+            } catch (...) {
+                smlogger.warn("Failed to remove the directory {} of dropped table {}: {}", dir, id, std::current_exception());
+            }
+        }
+        ts->created = false;
+        ts->dropped = false;
+    }
+    // A user that came during the removal waits for the lock, and keeps the
+    // state. It creates the directories again.
+    if (ts->users == 0) {
+        if (auto it = _table_storages.find(id); it != _table_storages.end() && it->second == ts) {
+            _table_storages.erase(it);
+            ts->unused.set_value();
+        }
+    }
+}
+
+future<> storage_manager::acquire_table_storage(table_id id, std::vector<std::filesystem::path> dirs) {
+    auto ts = use_table_storage(id);
+    std::exception_ptr ex;
+    try {
+        utils::get_local_injector().enter("storage_manager_acquire_table_storage");
+        // Waits for the removal of the directories of a dropped table with
+        // the same ID, if one is running.
+        auto units = co_await get_units(ts->lock, 1);
+        ts->dropped = false;
+        ts->dirs = std::move(dirs);
+        if (!ts->created) {
+            co_await init_table_directories(ts->dirs);
+            ts->created = true;
+        }
+        co_return;
+    } catch (...) {
+        ex = std::current_exception();
+    }
+    co_await unuse_table_storage(id, std::move(ts));
+    std::rethrow_exception(std::move(ex));
+}
+
+future<> storage_manager::release_table_storage(table_id id) noexcept {
+    auto it = _table_storages.find(id);
+    if (it == _table_storages.end()) {
+        on_internal_error_noexcept(smlogger, format("Releasing the storage of table {}, which has no user", id));
+        return make_ready_future<>();
+    }
+    return unuse_table_storage(id, it->second);
+}
+
+future<> storage_manager::drop_table_storage(table_id id, std::vector<std::filesystem::path> dirs) {
+    auto ts = use_table_storage(id);
+    try {
+        // The mark is set in the order of the lock, so that a table that is
+        // created later with the same ID clears it.
+        auto units = co_await get_units(ts->lock, 1);
+        ts->dropped = true;
+        ts->dirs = std::move(dirs);
+    } catch (...) {
+        smlogger.warn("Failed to mark the storage of table {} as dropped: {}", id, std::current_exception());
+    }
+    // Removes the directories now if this is the only user.
+    co_await unuse_table_storage(id, std::move(ts));
+}
+
+future<bool> storage_manager::remove_table_directory_if_unused(table_id id, std::filesystem::path dir) {
+    auto ts = use_table_storage(id);
+    bool unused = false;
+    try {
+        auto units = co_await get_units(ts->lock, 1);
+        unused = ts->users == 1;
+        if (unused) {
+            smlogger.info("Removing the directory {} of dropped table {}", dir, id);
+            co_await remove_table_directory_if_has_no_snapshots(dir);
+            ts->created = false;
+        }
+    } catch (...) {
+        smlogger.warn("Failed to remove the directory {} of dropped table {}: {}", dir, id, std::current_exception());
+    }
+    co_await unuse_table_storage(id, std::move(ts));
+    co_return unused;
+}
+
+future<> storage_manager::await_table_storage_unused(table_id id) {
+    auto it = _table_storages.find(id);
+    if (it == _table_storages.end()) {
+        return make_ready_future<>();
+    }
+    return it->second->unused.get_shared_future();
+}
 
 auto storage_manager::get_endpoint(const sstring& endpoint) -> object_storage_endpoint& {
     auto found = _object_storage_endpoints.find(endpoint);
@@ -498,6 +615,7 @@ future<> sstables_manager::close() noexcept {
     _closing = true;
     maybe_done();
     co_await _done.get_future();
+    co_await _table_storage_gate.close();
     co_await _sstable_metadata_concurrency_sem.stop();
     // stop the components reload fiber
     _components_memory_change_event.signal();
@@ -527,6 +645,113 @@ future<> sstables_manager::init_keyspace_storage(const data_dictionary::storage_
 
 future<> sstables_manager::destroy_table_storage(const data_dictionary::storage_options& so) {
     return sstables::destroy_table_storage(so);
+}
+
+table_storage::table_storage(sstables_manager& manager, table_id id, lw_shared_ptr<const data_dictionary::storage_options> options, bool counted)
+    : _manager(manager)
+    , _id(id)
+    , _options(std::move(options))
+    , _counted(counted)
+{
+}
+
+table_storage::~table_storage() {
+    if (_counted) {
+        _manager.release_table_storage(_id);
+    }
+}
+
+void sstables_manager::release_table_storage(table_id id) noexcept {
+    // The last reference can be dropped anywhere, so the release runs in the
+    // background. It removes the directory of a dropped table if this was the
+    // last reference on any shard. close() waits for it.
+    auto holder = _table_storage_gate.try_hold();
+    if (!holder) {
+        // Nothing can remove the directory anymore. It stays, as it does
+        // when the node stops before the removal.
+        smlogger.warn("The storage of table {} is released after the sstables manager is closed", id);
+        return;
+    }
+    (void)_storage->container().invoke_on(0, [id] (storage_manager& sm) {
+        return sm.release_table_storage(id);
+    }).handle_exception([id] (std::exception_ptr ex) {
+        smlogger.warn("Failed to release the storage of table {}: {}", id, ex);
+    }).finally([holder = std::move(*holder)] {});
+}
+
+future<table_storage_ptr> sstables_manager::open_table_storage(const schema& s, const data_dictionary::storage_options& keyspace_so) {
+    auto id = s.id();
+    auto so = make_table_storage_options(s, keyspace_so);
+    const auto* local = std::get_if<data_dictionary::storage_options::local>(&so->value);
+    if (!local || local->dir.empty()) {
+        // Object storage has no directory to create or to remove, so its
+        // users need no synchronization across shards. The same holds for a
+        // node without data directories.
+        co_return make_lw_shared<table_storage>(*this, id, std::move(so), false);
+    }
+    auto dirs = get_local_directories(*local);
+    if (!_storage) {
+        // There is no storage manager to count the references, so nothing
+        // removes the directories. Tests make such managers.
+        co_await init_table_directories(dirs);
+        co_return make_lw_shared<table_storage>(*this, id, std::move(so), false);
+    }
+    auto holder = _table_storage_gate.hold();
+    co_await _storage->container().invoke_on(0, [id, dirs = std::move(dirs)] (storage_manager& sm) mutable {
+        return sm.acquire_table_storage(id, std::move(dirs));
+    });
+    table_storage_ptr ts;
+    std::exception_ptr ex;
+    try {
+        ts = make_lw_shared<table_storage>(*this, id, std::move(so), true);
+    } catch (...) {
+        ex = std::current_exception();
+    }
+    if (ex) {
+        co_await _storage->container().invoke_on(0, [id] (storage_manager& sm) {
+            return sm.release_table_storage(id);
+        });
+        std::rethrow_exception(std::move(ex));
+    }
+    co_return ts;
+}
+
+table_storage_ptr sstables_manager::attach_table_storage(const schema& s, lw_shared_ptr<const data_dictionary::storage_options> so) {
+    return make_lw_shared<table_storage>(*this, s.id(), std::move(so), false);
+}
+
+future<> sstables_manager::drop_table_storage(table_id id, const data_dictionary::storage_options& table_so) {
+    const auto* local = std::get_if<data_dictionary::storage_options::local>(&table_so.value);
+    if (!local || local->dir.empty()) {
+        // Nothing is created for a table on object storage, see
+        // open_table_storage().
+        co_return;
+    }
+    auto dirs = get_local_directories(*local);
+    if (!_storage) {
+        on_internal_error(smlogger, format("Dropping the storage of table {} without a storage manager", id));
+    }
+    co_await _storage->container().invoke_on(0, [id, dirs = std::move(dirs)] (storage_manager& sm) mutable {
+        return sm.drop_table_storage(id, std::move(dirs));
+    });
+}
+
+future<bool> sstables_manager::remove_table_directory_if_unused(table_id id, std::filesystem::path table_dir) {
+    if (!_storage) {
+        on_internal_error(smlogger, format("Removing directory {} of table {} without a storage manager", table_dir, id));
+    }
+    return _storage->container().invoke_on(0, [id, table_dir = std::move(table_dir)] (storage_manager& sm) mutable {
+        return sm.remove_table_directory_if_unused(id, std::move(table_dir));
+    });
+}
+
+future<> sstables_manager::await_table_storage_unused(table_id id) {
+    if (!_storage) {
+        return make_ready_future<>();
+    }
+    return _storage->container().invoke_on(0, [id] (storage_manager& sm) {
+        return sm.await_table_storage_unused(id);
+    });
 }
 
 void sstables_manager::validate_new_keyspace_storage_options(const data_dictionary::storage_options& so) {

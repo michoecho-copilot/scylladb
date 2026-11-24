@@ -1436,18 +1436,21 @@ future<> init_table_storage(const sstables_manager& mgr, const data_dictionary::
             if (so.dir.empty()) {
                 on_internal_error(sstlog, "Non-table local storage options");
             }
-            auto dirs = get_local_directories(data_dirs, so);
-            co_await coroutine::parallel_for_each(dirs, [] (const fs::path& path) -> future<> {
-                auto dir = path.native();
-                co_await io_check([&dir] { return recursive_touch_directory(dir); });
-                co_await io_check([&dir] { return touch_directory(dir + "/upload"); });
-                co_await io_check([&dir] { return touch_directory(dir + "/staging"); });
-            });
+            co_await init_table_directories(get_local_directories(data_dirs, so));
         },
         [] (const data_dictionary::storage_options::object_storage&) -> future<> {
             co_return;
         }
     }, so.value);
+}
+
+future<> init_table_directories(const std::vector<std::filesystem::path>& dirs) {
+    co_await coroutine::parallel_for_each(dirs, [] (const fs::path& path) -> future<> {
+        auto dir = path.native();
+        co_await io_check([&dir] { return recursive_touch_directory(dir); });
+        co_await io_check([&dir] { return touch_directory(dir + "/upload"); });
+        co_await io_check([&dir] { return touch_directory(dir + "/staging"); });
+    });
 }
 
 future<> init_keyspace_storage(const sstables_manager& mgr, const data_dictionary::storage_options& so, sstring ks_name) {
